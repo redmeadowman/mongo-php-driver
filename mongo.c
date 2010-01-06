@@ -87,7 +87,7 @@ zend_class_entry *mongo_ce_Mongo,
   *mongo_ce_MinKey;
 
 /** Resources */
-int le_pconnection;
+int le_pconnection, le_callbacks, le_responses;
 
 ZEND_DECLARE_MODULE_GLOBALS(mongo)
 
@@ -268,6 +268,25 @@ static void php_mongo_link_pfree( zend_rsrc_list_entry *rsrc TSRMLS_DC ) {
 }
 /* }}} */
 
+
+/* {{{ php_mongo_callbacks_pfree
+ */
+static void php_mongo_callbacks_pfree(zend_rsrc_list_entry *rsrc TSRMLS_DC) {
+  mongo_callback *prev;
+  mongo_callback *callback = (mongo_callback*)rsrc->ptr;
+
+  while (callback->next) {
+    pefree(callback->func, 1);
+    callback = callback->next;
+    pefree(callback->prev);
+  }
+
+  pefree(callback->func, 1);
+  pefree(callback, 1);
+}
+/* }}} */
+
+
 /* {{{ PHP_MINIT_FUNCTION
  */
 PHP_MINIT_FUNCTION(mongo) {
@@ -280,9 +299,12 @@ PHP_MINIT_FUNCTION(mongo) {
   REGISTER_INI_ENTRIES();
 
   le_pconnection = zend_register_list_destructors_ex(NULL, php_mongo_link_pfree, PHP_CONNECTION_RES_NAME, module_number);
+  le_callbacks = zend_register_list_destructors_ex(NULL, php_mongo_callbacks_pfree, PHP_CALLBACKS_RES_NAME, module_number);
+  le_responses = zend_register_list_destructors_ex(NULL, php_mongo_responses_pfree, PHP_RESPONSES_RES_NAME, module_number);
 
   mongo_init_Mongo(TSRMLS_C);
   mongo_init_MongoDB(TSRMLS_C);
+
   mongo_init_MongoCollection(TSRMLS_C);
   mongo_init_MongoCursor(TSRMLS_C);
 
@@ -473,6 +495,161 @@ void mongo_init_Mongo(TSRMLS_D) {
 
   zend_declare_property_null(mongo_ce_Mongo, "persistent", strlen("persistent"), ZEND_ACC_PROTECTED TSRMLS_CC);
 }
+
+static void call_callback(mongo_callback *callback) {
+  char *lcname;
+  zend_function *fptr;
+  zval ***params, *retval_ptr;
+  int result;
+  // TODO: let this take a variable number of args
+  int argc = 1;
+  zend_fcall_info fci;
+  zend_fcall_info_cache fcc;
+
+  // execute this callback
+  lcname = zend_str_tolower_dup(callback->func, strlen(callback->func));
+  if (zend_hash_find(EG(function_table), lcname, strlen(callback->func) + 1, (void **)&fptr) == FAILURE) {
+    efree(lcname);
+    return;
+  }
+  efree(lcname);
+          
+  params = safe_emalloc(sizeof(zval **), argc, 0);
+  if (zend_get_parameters_array_ex(argc, params) == FAILURE) {
+    efree(params);
+    RETURN_FALSE;
+  }
+          
+  fci.size = sizeof(fci);
+  fci.function_table = NULL;
+  fci.function_name = NULL;
+  fci.symbol_table = NULL;
+          
+#if ZEND_MODULE_API_NO >= 20090115
+  fci.object_ptr = NULL;
+#else
+  fci.object_pp = NULL;
+#endif
+
+  fci.retval_ptr_ptr = &retval_ptr;
+  fci.param_count = argc;
+  fci.params = params;
+  fci.no_separation = 1;
+          
+  fcc.initialized = 1;
+  fcc.function_handler = fptr;
+  fcc.calling_scope = EG(scope);
+          
+#if ZEND_MODULE_API_NO >= 20090115
+  fcc.called_scope = NULL;
+  fcc.object_ptr = NULL;
+#else
+  fcc.object_pp = NULL;
+#endif
+
+  result = zend_call_function(&fci, &fcc TSRMLS_CC);
+          
+  efree(params);
+          
+  if (retval_ptr) {
+    zval_ptr_dtor(&retval_ptr);
+  }
+
+  // remove this callback
+
+  // relocate prev->next ptr
+  if (callback->prev) {
+    callback->prev->next = callback->next;
+  }
+  else {
+    le->ptr = callback->next;
+  }
+
+  // relocate next->prev ptr
+  if (callback->next) {
+    callback->next->prev = callback->prev;
+  }
+
+  pefree(callback->func, 1);
+  pefree(callback);
+}
+
+/*
+ * Each connection to the database starts a thread that executes this function.
+ * db_listener scoops up any incoming db responses asyncronously 
+ */
+void db_listener(void *arg) {
+  int sock = php_mongo_get_master(cursor->link TSRMLS_CC);
+  mongo_callback *callback_list;
+  mongo_server_set *set = (mongo_server_set*)arg;
+  zend_rsrc_list_entry *cle, *rle;
+
+  if (zend_hash_find(&EG(persistent_list), "callbacks", strlen("callbacks")+1, (void**)&cle) == SUCCESS) {
+    callback_list = cle->ptr;
+  }
+
+  if (zend_hash_find(&EG(persistent_list), "responses", strlen("responses")+1, (void**)&rle) == SUCCESS) {
+    response_list = rle->ptr;
+  }
+
+  // set a timeout
+ forever:
+  while (connected) {
+    struct timeval timeout;
+    fd_set readfds;
+
+    // block for 1ms, just check if anything is there
+    timeout.tv_sec = 0 ;
+    timeout.tv_usec = 1000;
+
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+
+    select(sock+1, &readfds, NULL, NULL, &timeout);
+
+    // if there's something to read, get it
+    if (FD_ISSET(sock, &readfds)) {
+      int ts = time(0), int done = 0;
+      mongo_cursor *cursor;
+      mongo_callback *callback = callback_list;
+      zval *errmsg;
+
+      // get the db response
+      MAKE_STD_ZVAL(errmsg);
+      ZVAL_NULL(errmsg);
+      if (get_header(sock, cursor, errmsg) == FAILURE ||
+          get_body(sock, cursor, errmsg) == FAILURE) {
+        zval_ptr_dtor(&errmsg);
+        return;
+      }
+      zval_ptr_dtor(&errmsg);
+
+      // if it has a callback registered, execute that
+      while (callback) {
+        if (callback->id == cursor->recv.response_to) {
+          call_callback(callback);
+          done = 1;
+          break;
+        }
+        callback = callback->next;
+      }
+
+      if (done) continue;
+
+      // otherwise store it in persistent storage
+      while (response) {
+        if (response->id == cursor->recv.response_to) {
+          response->cursor = cursor;
+          break;
+        }
+        response = response.next;
+      }
+
+
+    }
+  }
+}
+
 
 /*
  * this deals with the new mongo connection format:
@@ -920,6 +1097,20 @@ static void connect_already(INTERNAL_FUNCTION_PARAMETERS, zval *errmsg) {
 
   /* Mongo::connected = true */
   zend_update_property_bool(mongo_ce_Mongo, getThis(), "connected", strlen("connected"), 1 TSRMLS_CC);
+
+
+
+
+  /* 
+   * multithreading stuff!!!
+   */
+  pthread_t thread_id;
+  pthread_create(&thread_id, NULL, db_listener, (void*)link->server);
+  
+
+
+
+
 
   /* 
    * if we're doing a persistent connection, store a reference in the 
@@ -1543,6 +1734,58 @@ static int get_header(int sock, mongo_cursor *cursor, zval *errmsg) {
   return SUCCESS;
 }
 
+int get_body(int sock, mongo_cursor *cursor, zval *errmsg) {
+  if (recv(sock, (char*)&cursor->flag, INT_32, FLAGS) == FAILURE ||
+      recv(sock, (char*)&cursor->cursor_id, INT_64, FLAGS) == FAILURE ||
+      recv(sock, (char*)&cursor->start, INT_32, FLAGS) == FAILURE ||
+      recv(sock, (char*)&num_returned, INT_32, FLAGS) == FAILURE) {
+
+    ZVAL_STRING(errmsg, "incomplete response", 1);
+    return FAILURE;
+  }
+
+  cursor_ptr = (char*)&temp_id;
+  mongo_memcpy(cursor_ptr, &cursor->cursor_id, INT_64);
+  cursor->cursor_id = temp_id;
+
+  cursor->flag = MONGO_INT(cursor->flag);
+  cursor->start = MONGO_INT(cursor->start);
+  num_returned = MONGO_INT(num_returned);
+
+  // create buf
+  cursor->recv.length -= REPLY_HEADER_LEN;
+
+  // point buf.start at buf's first char
+  if (!cursor->buf.start) {
+    cursor->buf.start = (unsigned char*)emalloc(cursor->recv.length);
+    cursor->buf.end = cursor->buf.start + cursor->recv.length;
+  }
+  /* if we've already got a buffer allocated but it's too small, resize it
+   * 
+   * TODO: profile with a large response
+   * this might actually be slower than freeing/reallocating, as it might
+   * have to copy over all the bytes if there isn't contiguous free space.  
+   */
+  else if (cursor->buf.end - cursor->buf.start < cursor->recv.length) {
+    cursor->buf.start = (unsigned char*)erealloc(cursor->buf.start, cursor->recv.length);
+    cursor->buf.end = cursor->buf.start + cursor->recv.length;
+  }
+  cursor->buf.pos = cursor->buf.start;
+
+  /* get the actual response content */
+  if (mongo_hear(cursor->link, cursor->buf.pos, cursor->recv.length TSRMLS_CC) == FAILURE) {
+    char *msg;
+#ifdef WIN32
+    spprintf(&msg, 0, "WSA error getting database response: %d", WSAGetLastError());
+#else
+    spprintf(&msg, 0, "error getting database response: %s", strerror(errno));
+#endif
+    ZVAL_STRING(errmsg, msg, 0);
+    return FAILURE;
+  }
+  return SUCCESS;
+}
+
 int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
   int sock = php_mongo_get_master(cursor->link TSRMLS_CC);
   int num_returned = 0;
@@ -1600,52 +1843,7 @@ int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
     }
   }
 
-  if (recv(sock, (char*)&cursor->flag, INT_32, FLAGS) == FAILURE ||
-      recv(sock, (char*)&cursor->cursor_id, INT_64, FLAGS) == FAILURE ||
-      recv(sock, (char*)&cursor->start, INT_32, FLAGS) == FAILURE ||
-      recv(sock, (char*)&num_returned, INT_32, FLAGS) == FAILURE) {
-
-    ZVAL_STRING(errmsg, "incomplete response", 1);
-    return FAILURE;
-  }
-
-  cursor_ptr = (char*)&temp_id;
-  mongo_memcpy(cursor_ptr, &cursor->cursor_id, INT_64);
-  cursor->cursor_id = temp_id;
-
-  cursor->flag = MONGO_INT(cursor->flag);
-  cursor->start = MONGO_INT(cursor->start);
-  num_returned = MONGO_INT(num_returned);
-
-  // create buf
-  cursor->recv.length -= REPLY_HEADER_LEN;
-
-  // point buf.start at buf's first char
-  if (!cursor->buf.start) {
-    cursor->buf.start = (unsigned char*)emalloc(cursor->recv.length);
-    cursor->buf.end = cursor->buf.start + cursor->recv.length;
-  }
-  /* if we've already got a buffer allocated but it's too small, resize it
-   * 
-   * TODO: profile with a large response
-   * this might actually be slower than freeing/reallocating, as it might
-   * have to copy over all the bytes if there isn't contiguous free space.  
-   */
-  else if (cursor->buf.end - cursor->buf.start < cursor->recv.length) {
-    cursor->buf.start = (unsigned char*)erealloc(cursor->buf.start, cursor->recv.length);
-    cursor->buf.end = cursor->buf.start + cursor->recv.length;
-  }
-  cursor->buf.pos = cursor->buf.start;
-
-  /* get the actual response content */
-  if (mongo_hear(cursor->link, cursor->buf.pos, cursor->recv.length TSRMLS_CC) == FAILURE) {
-    char *msg;
-#ifdef WIN32
-    spprintf(&msg, 0, "WSA error getting database response: %d", WSAGetLastError());
-#else
-    spprintf(&msg, 0, "error getting database response: %s", strerror(errno));
-#endif
-    ZVAL_STRING(errmsg, msg, 0);
+  if (get_body(sock, cursor, errmsg) == FAILURE) {
     return FAILURE;
   }
 

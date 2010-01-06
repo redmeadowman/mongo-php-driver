@@ -159,6 +159,26 @@ static void make_special(mongo_cursor *cursor) {
   add_assoc_zval(cursor->query, "query", temp);
 }
 
+void mongo_php_store_request() {
+  // store request info in requests list
+  mongo_response *response = (mongo_response*)pemalloc(sizeof(mongo_response), 1);
+  response->id = cursor->send.request_id;
+  response->next = response->prev = response->cursor = 0;
+
+  if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == SUCCESS) {
+    mongo_response *current = le->ptr;
+
+    while (current->next) {
+      current = current->next;
+    }
+    current->next = response;
+    response->prev = current;
+  }
+  else {
+    ZEND_REGISTER_RESOURCE(NULL, response, le_responses);
+  }
+}
+
 /* {{{ MongoCursor::hasNext
  */
 PHP_METHOD(MongoCursor, hasNext) {
@@ -195,6 +215,7 @@ PHP_METHOD(MongoCursor, hasNext) {
 
   CREATE_RESPONSE_HEADER(buf, cursor->ns, cursor->recv.request_id, OP_GET_MORE);
   cursor->send.request_id = header.request_id;
+  mongo_php_store_request(cursor->send.request_id);
 
   php_mongo_serialize_int(&buf, cursor->limit);
   php_mongo_serialize_long(&buf, cursor->cursor_id);
@@ -323,6 +344,46 @@ PHP_METHOD(MongoCursor, timeout) {
   cursor->timeout = timeout;
 
   RETURN_ZVAL(getThis(), 1, 0);
+}
+/* }}} */
+
+
+/* {{{ MongoCursor::async
+ */
+PHP_METHOD(MongoCursor, async) {
+  mongo_callback *callback, *temp;
+  zend_rsrc_list_entry *le;
+  mongo_cursor *cursor = (mongo_cursor*)zend_object_store_get_object(getThis() TSRMLS_CC);
+  MONGO_CHECK_INITIALIZED(cursor->link, MongoCursor);
+
+  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &name_str, &name_len) == FAILURE) {
+    return;
+  }
+
+  callback = (mongo_callback*)pemalloc(sizeof(mongo_callback), 1);
+  callback->id = cursor->send->request_id;
+  callback->name = pestrdup(name_str, 1);
+
+  // check if the callbacks persistent resource exists
+  if (zend_hash_find(&EG(persistent_list), "callbacks", strlen("callbacks")+1, (void**)&le) == FAILURE) {
+    // if it doesn't, create it
+    callback->next = callback->prev = 0;
+    ZEND_REGISTER_RESOURCE(NULL, callback, le_callbacks);
+    return;
+  }
+
+  // if it does, get to the end of the list and add the new callback
+  temp = le->ptr;
+  while (temp->next) {
+    temp = temp->next;
+  }
+
+  temp->next = callback;
+  callback->prev = temp;
+  callback->next = 0;
+
+  // Yay, we saved the callback.  Now we just return null.
+  RETURN_NULL();
 }
 /* }}} */
 
@@ -686,6 +747,7 @@ static function_entry MongoCursor_methods[] = {
   PHP_ME(MongoCursor, tailable, NULL, ZEND_ACC_PUBLIC)
   PHP_ME(MongoCursor, immortal, NULL, ZEND_ACC_PUBLIC)
   PHP_ME(MongoCursor, timeout, NULL, ZEND_ACC_PUBLIC)
+  PHP_ME(MongoCursor, async, NULL, ZEND_ACC_PUBLIC)
   PHP_ME(MongoCursor, dead, NULL, ZEND_ACC_PUBLIC)
   PHP_ME(MongoCursor, snapshot, NULL, ZEND_ACC_PUBLIC)
   PHP_ME(MongoCursor, sort, NULL, ZEND_ACC_PUBLIC)
