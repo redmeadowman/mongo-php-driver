@@ -23,8 +23,7 @@
 
 // resource names
 #define PHP_CONNECTION_RES_NAME "mongo connection"
-#define PHP_CALLBACKS_RES_NAME "mongo callback list"
-#define PHP_RESPONSES_RES_NAME "mongo response list"
+#define PHP_REQUEST_RES_NAME "mongo request list"
 
 
 #ifdef WIN32
@@ -296,22 +295,21 @@ typedef struct {
 } mongo_cursor;
 
 
-typedef struct {
-  int id;
-
-  char *func;
-
-  mongo_callback *next;
-  mongo_callback *prev;
-} mongo_callback;
-
-typedef struct {
+typedef struct _mongo_request {
   int id;
   mongo_cursor *cursor;
 
-  mongo_callback *next;
-  mongo_callback *prev;
-} mongo_response;
+  // optional callback for async request
+  char *callback;
+
+  struct _mongo_request *next;
+  struct _mongo_request *prev;
+} mongo_request;
+
+typedef struct _pthread_arg {
+    mongo_link *link;
+    void *tsrmls_cc;
+} mongo_pthread_arg;
 
 
 typedef struct {

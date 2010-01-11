@@ -38,7 +38,8 @@ extern zend_class_entry *mongo_ce_Id,
   *mongo_ce_Exception,
   *mongo_ce_CursorException;
 
-extern int le_pconnection;
+extern int le_pconnection,
+  le_requests;
 
 extern zend_object_handlers mongo_default_handlers;
 
@@ -48,6 +49,7 @@ ZEND_EXTERN_MODULE_GLOBALS(mongo);
 static void kill_cursor(mongo_cursor *cursor TSRMLS_DC);
 static zend_object_value php_mongo_cursor_new(zend_class_entry *class_type TSRMLS_DC);
 static void make_special(mongo_cursor *);
+static mongo_cursor* send_query(zval*, zval* TSRMLS_DC);
 
 zend_class_entry *mongo_ce_Cursor = NULL;
 
@@ -159,23 +161,25 @@ static void make_special(mongo_cursor *cursor) {
   add_assoc_zval(cursor->query, "query", temp);
 }
 
-void mongo_php_store_request() {
+void php_mongo_store_request(mongo_cursor *cursor TSRMLS_DC) {
   // store request info in requests list
-  mongo_response *response = (mongo_response*)pemalloc(sizeof(mongo_response), 1);
-  response->id = cursor->send.request_id;
-  response->next = response->prev = response->cursor = 0;
+  mongo_request *request = (mongo_request*)pemalloc(sizeof(mongo_request), 1);
+  zend_rsrc_list_entry *le;
+  request->id = cursor->send.request_id;
+  request->cursor = 0;
+  request->next = request->prev = 0;
 
   if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == SUCCESS) {
-    mongo_response *current = le->ptr;
+    mongo_request *current = le->ptr;
 
     while (current->next) {
       current = current->next;
     }
-    current->next = response;
-    response->prev = current;
+    current->next = request;
+    request->prev = current;
   }
   else {
-    ZEND_REGISTER_RESOURCE(NULL, response, le_responses);
+    ZEND_REGISTER_RESOURCE(NULL, request, le_requests);
   }
 }
 
@@ -215,7 +219,7 @@ PHP_METHOD(MongoCursor, hasNext) {
 
   CREATE_RESPONSE_HEADER(buf, cursor->ns, cursor->recv.request_id, OP_GET_MORE);
   cursor->send.request_id = header.request_id;
-  mongo_php_store_request(cursor->send.request_id);
+  mongo_php_store_request(cursor TSRMLS_CC);
 
   php_mongo_serialize_int(&buf, cursor->limit);
   php_mongo_serialize_long(&buf, cursor->cursor_id);
@@ -351,39 +355,43 @@ PHP_METHOD(MongoCursor, timeout) {
 /* {{{ MongoCursor::async
  */
 PHP_METHOD(MongoCursor, async) {
-  mongo_callback *callback, *temp;
+  mongo_request *request;
   zend_rsrc_list_entry *le;
   mongo_cursor *cursor = (mongo_cursor*)zend_object_store_get_object(getThis() TSRMLS_CC);
+  char *name_str;
+  int name_len;
   MONGO_CHECK_INITIALIZED(cursor->link, MongoCursor);
 
   if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &name_str, &name_len) == FAILURE) {
     return;
   }
 
-  callback = (mongo_callback*)pemalloc(sizeof(mongo_callback), 1);
-  callback->id = cursor->send->request_id;
-  callback->name = pestrdup(name_str, 1);
+  request = (mongo_request*)pemalloc(sizeof(mongo_request), 1);
+  request->callback = pestrdup(name_str, 1);
 
   // check if the callbacks persistent resource exists
-  if (zend_hash_find(&EG(persistent_list), "callbacks", strlen("callbacks")+1, (void**)&le) == FAILURE) {
+  if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == FAILURE) {
     // if it doesn't, create it
-    callback->next = callback->prev = 0;
-    ZEND_REGISTER_RESOURCE(NULL, callback, le_callbacks);
-    return;
+    request->next = request->prev = 0;
+    ZEND_REGISTER_RESOURCE(NULL, request, le_requests);
+  }
+  else {
+    mongo_request *temp;
+
+    // if it does, get to the end of the list and add the new callback
+    temp = le->ptr;
+    while (temp->next) {
+      temp = temp->next;
+    }
+    
+    temp->next = request;
+    request->prev = temp;
+    request->next = 0;
   }
 
-  // if it does, get to the end of the list and add the new callback
-  temp = le->ptr;
-  while (temp->next) {
-    temp = temp->next;
-  }
-
-  temp->next = callback;
-  callback->prev = temp;
-  callback->next = 0;
-
-  // Yay, we saved the callback.  Now we just return null.
-  RETURN_NULL();
+  send_query(getThis(), return_value TSRMLS_CC);
+  request->id = cursor->send.request_id;
+  php_printf("{id : %d, func : %s (%p)}\n", request->id, request->callback, request->callback);
 }
 /* }}} */
 
@@ -489,10 +497,7 @@ PHP_METHOD(MongoCursor, explain) {
 }
 /* }}} */
 
-
-/* {{{ MongoCursor->doQuery
- */
-PHP_METHOD(MongoCursor, doQuery) {
+static mongo_cursor* send_query(zval *this_ptr, zval *return_value TSRMLS_DC) {
   int sent;
   mongo_msg_header header;
   mongo_cursor *cursor;
@@ -518,16 +523,30 @@ PHP_METHOD(MongoCursor, doQuery) {
 
   MAKE_STD_ZVAL(temp);
   ZVAL_NULL(temp);
+  php_printf("sending\n");
   sent = mongo_say(cursor->link, &buf, temp TSRMLS_CC);
   efree(buf.start);
   if (sent == FAILURE) {
     zend_throw_exception(mongo_ce_CursorException, "couldn't send query.", 0 TSRMLS_CC);
     zval_ptr_dtor(&temp);
-    return;
+    return 0;
   }
-
-  php_mongo_get_reply(cursor, temp TSRMLS_CC);
   zval_ptr_dtor(&temp);
+  return cursor;
+}
+
+
+/* {{{ MongoCursor->doQuery
+ */
+PHP_METHOD(MongoCursor, doQuery) {
+  mongo_cursor *cursor = send_query(getThis(), return_value TSRMLS_CC);
+  if (cursor) {
+    zval *temp;
+    MAKE_STD_ZVAL(temp);
+    ZVAL_NULL(temp);
+    php_mongo_get_reply(cursor, temp TSRMLS_CC);
+    zval_ptr_dtor(&temp);
+  }
 }
 /* }}} */
 

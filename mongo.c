@@ -61,6 +61,7 @@ extern zend_class_entry *mongo_ce_DB,
   *mongo_ce_Timestamp;
 
 static void php_mongo_link_free(void* TSRMLS_DC);
+static void php_mongo_request_pfree(zend_rsrc_list_entry* TSRMLS_DC);
 static void connect_already(INTERNAL_FUNCTION_PARAMETERS, zval*);
 static int php_mongo_get_master(mongo_link* TSRMLS_DC);
 static int php_mongo_check_connection(mongo_link*, zval* TSRMLS_DC);
@@ -73,6 +74,11 @@ static void mongo_init_MongoExceptions(TSRMLS_D);
 static void run_err(int, zval*, zval* TSRMLS_DC);
 static int php_mongo_parse_server(zval*, zval* TSRMLS_DC);
 static void set_disconnected(mongo_link *link);
+
+static void call_callback(mongo_request*, list_entry* TSRMLS_DC);
+
+static int get_header(int, mongo_cursor*, zval*);
+static int get_body(int, mongo_cursor*, zval* TSRMLS_DC);
 
 zend_object_handlers mongo_default_handlers;
 
@@ -87,7 +93,7 @@ zend_class_entry *mongo_ce_Mongo,
   *mongo_ce_MinKey;
 
 /** Resources */
-int le_pconnection, le_callbacks, le_responses;
+int le_pconnection, le_requests;
 
 ZEND_DECLARE_MODULE_GLOBALS(mongo)
 
@@ -185,6 +191,7 @@ PHP_INI_END()
 
 
 static void php_mongo_server_free(mongo_server_set *server_set, int persist TSRMLS_DC) {
+  php_printf("in free\n");
   int i;
 
   if (!server_set || !server_set->num) {
@@ -235,7 +242,9 @@ static void php_mongo_link_free(void *object TSRMLS_DC) {
   // link->persist!=0 means it's either a persistent link or a copy of one
   // either way, we don't want to deallocate the memory yet
   if (!persist) {
+    php_printf("link->server_set = %p\n", link->server_set);
     php_mongo_server_free(link->server_set, 0 TSRMLS_CC);
+    //    link->server_set = 0;
   }
 
   if (link->username) {
@@ -269,20 +278,20 @@ static void php_mongo_link_pfree( zend_rsrc_list_entry *rsrc TSRMLS_DC ) {
 /* }}} */
 
 
-/* {{{ php_mongo_callbacks_pfree
+/* {{{ php_mongo_request_pfree
  */
-static void php_mongo_callbacks_pfree(zend_rsrc_list_entry *rsrc TSRMLS_DC) {
-  mongo_callback *prev;
-  mongo_callback *callback = (mongo_callback*)rsrc->ptr;
+static void php_mongo_request_pfree(zend_rsrc_list_entry *rsrc TSRMLS_DC) {
+  mongo_request *prev;
+  mongo_request *request = (mongo_request*)rsrc->ptr;
 
-  while (callback->next) {
-    pefree(callback->func, 1);
-    callback = callback->next;
-    pefree(callback->prev);
+  while (request->next) {
+    pefree(request->callback, 1);
+    request = request->next;
+    pefree(request->prev, 1);
   }
 
-  pefree(callback->func, 1);
-  pefree(callback, 1);
+  pefree(request->callback, 1);
+  pefree(request, 1);
 }
 /* }}} */
 
@@ -299,8 +308,7 @@ PHP_MINIT_FUNCTION(mongo) {
   REGISTER_INI_ENTRIES();
 
   le_pconnection = zend_register_list_destructors_ex(NULL, php_mongo_link_pfree, PHP_CONNECTION_RES_NAME, module_number);
-  le_callbacks = zend_register_list_destructors_ex(NULL, php_mongo_callbacks_pfree, PHP_CALLBACKS_RES_NAME, module_number);
-  le_responses = zend_register_list_destructors_ex(NULL, php_mongo_responses_pfree, PHP_RESPONSES_RES_NAME, module_number);
+  le_requests = zend_register_list_destructors_ex(NULL, php_mongo_request_pfree, PHP_REQUEST_RES_NAME, module_number);
 
   mongo_init_Mongo(TSRMLS_C);
   mongo_init_MongoDB(TSRMLS_C);
@@ -496,7 +504,7 @@ void mongo_init_Mongo(TSRMLS_D) {
   zend_declare_property_null(mongo_ce_Mongo, "persistent", strlen("persistent"), ZEND_ACC_PROTECTED TSRMLS_CC);
 }
 
-static void call_callback(mongo_callback *callback) {
+static void call_callback(mongo_request *request, list_entry *le TSRMLS_DC) {
   char *lcname;
   zend_function *fptr;
   zval ***params, *retval_ptr;
@@ -507,8 +515,8 @@ static void call_callback(mongo_callback *callback) {
   zend_fcall_info_cache fcc;
 
   // execute this callback
-  lcname = zend_str_tolower_dup(callback->func, strlen(callback->func));
-  if (zend_hash_find(EG(function_table), lcname, strlen(callback->func) + 1, (void **)&fptr) == FAILURE) {
+  lcname = zend_str_tolower_dup(request->callback, strlen(request->callback));
+  if (zend_hash_find(EG(function_table), lcname, strlen(request->callback) + 1, (void **)&fptr) == FAILURE) {
     efree(lcname);
     return;
   }
@@ -517,7 +525,7 @@ static void call_callback(mongo_callback *callback) {
   params = safe_emalloc(sizeof(zval **), argc, 0);
   if (zend_get_parameters_array_ex(argc, params) == FAILURE) {
     efree(params);
-    RETURN_FALSE;
+    return;
   }
           
   fci.size = sizeof(fci);
@@ -558,20 +566,20 @@ static void call_callback(mongo_callback *callback) {
   // remove this callback
 
   // relocate prev->next ptr
-  if (callback->prev) {
-    callback->prev->next = callback->next;
+  if (request->prev) {
+    request->prev->next = request->next;
   }
   else {
-    le->ptr = callback->next;
+    le->ptr = request->next;
   }
 
   // relocate next->prev ptr
-  if (callback->next) {
-    callback->next->prev = callback->prev;
+  if (request->next) {
+    request->next->prev = request->prev;
   }
 
-  pefree(callback->func, 1);
-  pefree(callback);
+  pefree(request->callback, 1);
+  pefree(request, 1);
 }
 
 /*
@@ -579,74 +587,63 @@ static void call_callback(mongo_callback *callback) {
  * db_listener scoops up any incoming db responses asyncronously 
  */
 void db_listener(void *arg) {
-  int sock = php_mongo_get_master(cursor->link TSRMLS_CC);
-  mongo_callback *callback_list;
-  mongo_server_set *set = (mongo_server_set*)arg;
-  zend_rsrc_list_entry *cle, *rle;
+  mongo_pthread_arg *parg = (mongo_pthread_arg*)arg;
+  TSRMLS_D = parg->tsrmls_cc;
+  mongo_link *link = parg->link;
+  int sock = php_mongo_get_master(link TSRMLS_CC);
+  mongo_request *request_list = 0;
+  mongo_server_set *set = ((mongo_link*)link)->server_set;
+  zend_rsrc_list_entry *le;
 
-  if (zend_hash_find(&EG(persistent_list), "callbacks", strlen("callbacks")+1, (void**)&cle) == SUCCESS) {
-    callback_list = cle->ptr;
-  }
-
-  if (zend_hash_find(&EG(persistent_list), "responses", strlen("responses")+1, (void**)&rle) == SUCCESS) {
-    response_list = rle->ptr;
+  if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == SUCCESS) {
+    request_list = (mongo_request*)le->ptr;
+    php_printf("found one! %p\n", request_list);
   }
 
   // set a timeout
  forever:
-  while (connected) {
-    struct timeval timeout;
-    fd_set readfds;
-
-    // block for 1ms, just check if anything is there
-    timeout.tv_sec = 0 ;
-    timeout.tv_usec = 1000;
-
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-
-    select(sock+1, &readfds, NULL, NULL, &timeout);
-
-    // if there's something to read, get it
-    if (FD_ISSET(sock, &readfds)) {
-      int ts = time(0), int done = 0;
-      mongo_cursor *cursor;
-      mongo_callback *callback = callback_list;
+  while (set) {
+      int ts = time(0), done = 0;
+      mongo_cursor *cursor = (mongo_cursor*)pemalloc(sizeof(mongo_cursor), 1);
+      mongo_msg_header recv;
+      mongo_request *request = request_list;
       zval *errmsg;
+
+      // make a cursor
+      cursor->link = link;
+      cursor->recv = recv;
 
       // get the db response
       MAKE_STD_ZVAL(errmsg);
       ZVAL_NULL(errmsg);
-      if (get_header(sock, cursor, errmsg) == FAILURE ||
-          get_body(sock, cursor, errmsg) == FAILURE) {
+      php_printf("getting header: %d\n", cursor->recv.length);
+      if (get_header(sock, cursor, errmsg) == FAILURE) {
+        php_printf("no header\n");
         zval_ptr_dtor(&errmsg);
-        return;
+        break;
       }
+      php_printf("getting body\n");
+      if(get_body(sock, cursor, errmsg TSRMLS_CC) == FAILURE) {
+        zval_ptr_dtor(&errmsg);
+        break;
+      }
+      php_printf("got body\n");
       zval_ptr_dtor(&errmsg);
 
       // if it has a callback registered, execute that
-      while (callback) {
-        if (callback->id == cursor->recv.response_to) {
-          call_callback(callback);
-          done = 1;
-          break;
+      php_printf("callback: %p\n", request);
+      while (request) {
+        php_printf("%d == %d\n", request->id, cursor->recv.response_to);
+        if (request->id == cursor->recv.response_to) {
+          request->cursor = cursor;
+          if (request->callback) {
+            php_printf("in callback: %s\n", request->callback);
+            call_callback(request, le TSRMLS_CC);
+            break;
+          }
         }
-        callback = callback->next;
+        request = request->next;
       }
-
-      if (done) continue;
-
-      // otherwise store it in persistent storage
-      while (response) {
-        if (response->id == cursor->recv.response_to) {
-          response->cursor = cursor;
-          break;
-        }
-        response = response.next;
-      }
-
-
-    }
   }
 }
 
@@ -1105,8 +1102,11 @@ static void connect_already(INTERNAL_FUNCTION_PARAMETERS, zval *errmsg) {
    * multithreading stuff!!!
    */
   pthread_t thread_id;
-  pthread_create(&thread_id, NULL, db_listener, (void*)link->server);
-  
+  mongo_pthread_arg *temp_arg = (mongo_pthread_arg*)pemalloc(sizeof(mongo_pthread_arg), 1);
+  temp_arg->link = link;
+  temp_arg->tsrmls_cc = TSRMLS_C;
+  pthread_create(&thread_id, NULL, (void*)db_listener, (void*)temp_arg);
+  php_printf("sock: %d\n", link->server_set->server[0]->socket);
 
 
 
@@ -1686,10 +1686,9 @@ static int php_mongo_get_master(mongo_link *link TSRMLS_DC) {
  */
 static int get_header(int sock, mongo_cursor *cursor, zval *errmsg) {
   if (recv(sock, (char*)&cursor->recv.length, INT_32, FLAGS) == FAILURE) {
-
     set_disconnected(cursor->link);
-
-    ZVAL_STRING(errmsg, "couldn't get response header", 1);
+  
+    ZVAL_STRING(errmsg, strerror(errno), 1);
     return FAILURE;
   }
 
@@ -1734,7 +1733,11 @@ static int get_header(int sock, mongo_cursor *cursor, zval *errmsg) {
   return SUCCESS;
 }
 
-int get_body(int sock, mongo_cursor *cursor, zval *errmsg) {
+int get_body(int sock, mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
+  int64_t temp_id;
+  char *cursor_ptr;
+  int num_returned = 0;
+
   if (recv(sock, (char*)&cursor->flag, INT_32, FLAGS) == FAILURE ||
       recv(sock, (char*)&cursor->cursor_id, INT_64, FLAGS) == FAILURE ||
       recv(sock, (char*)&cursor->start, INT_32, FLAGS) == FAILURE ||
@@ -1783,14 +1786,12 @@ int get_body(int sock, mongo_cursor *cursor, zval *errmsg) {
     ZVAL_STRING(errmsg, msg, 0);
     return FAILURE;
   }
-  return SUCCESS;
+  return num_returned;
 }
 
 int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
   int sock = php_mongo_get_master(cursor->link TSRMLS_CC);
   int num_returned = 0;
-  int64_t temp_id;
-  char *cursor_ptr;
 
   if (php_mongo_check_connection(cursor->link, errmsg TSRMLS_CC) != SUCCESS) {
     ZVAL_STRING(errmsg, "could not establish db connection", 1);
@@ -1843,7 +1844,7 @@ int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
     }
   }
 
-  if (get_body(sock, cursor, errmsg) == FAILURE) {
+  if ((num_returned = get_body(sock, cursor, errmsg TSRMLS_CC)) == FAILURE) {
     return FAILURE;
   }
 
