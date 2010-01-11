@@ -591,59 +591,56 @@ void db_listener(void *arg) {
   TSRMLS_D = parg->tsrmls_cc;
   mongo_link *link = parg->link;
   int sock = php_mongo_get_master(link TSRMLS_CC);
-  mongo_request *request_list = 0;
   mongo_server_set *set = ((mongo_link*)link)->server_set;
   zend_rsrc_list_entry *le;
 
-  if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == SUCCESS) {
-    request_list = (mongo_request*)le->ptr;
-    php_printf("found one! %p\n", request_list);
-  }
 
-  // set a timeout
- forever:
   while (set) {
-      int ts = time(0), done = 0;
-      mongo_cursor *cursor = (mongo_cursor*)pemalloc(sizeof(mongo_cursor), 1);
-      mongo_msg_header recv;
-      mongo_request *request = request_list;
-      zval *errmsg;
+    int ts = time(0), done = 0;
+    mongo_cursor *cursor = (mongo_cursor*)pemalloc(sizeof(mongo_cursor), 1);
+    mongo_msg_header recv;
+    mongo_request *request = 0;
+    zval *errmsg;
 
-      // make a cursor
-      cursor->link = link;
-      cursor->recv = recv;
+    if (!request) {
+      if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == SUCCESS) {
+        request = (mongo_request*)le->ptr;
+      }
+      else {
+        //        pthread_yield();
+        continue;
+      }
+    }
 
-      // get the db response
-      MAKE_STD_ZVAL(errmsg);
-      ZVAL_NULL(errmsg);
-      php_printf("getting header: %d\n", cursor->recv.length);
-      if (get_header(sock, cursor, errmsg) == FAILURE) {
-        php_printf("no header\n");
-        zval_ptr_dtor(&errmsg);
-        break;
-      }
-      php_printf("getting body\n");
-      if(get_body(sock, cursor, errmsg TSRMLS_CC) == FAILURE) {
-        zval_ptr_dtor(&errmsg);
-        break;
-      }
-      php_printf("got body\n");
+    // make a cursor
+    cursor->link = link;
+    cursor->recv = recv;
+
+    // get the db response
+    MAKE_STD_ZVAL(errmsg);
+    ZVAL_NULL(errmsg);
+    if (get_header(sock, cursor, errmsg) == FAILURE) {
       zval_ptr_dtor(&errmsg);
+      break;
+    }
+    if(get_body(sock, cursor, errmsg TSRMLS_CC) == FAILURE) {
+      zval_ptr_dtor(&errmsg);
+      break;
+    }
+    zval_ptr_dtor(&errmsg);
 
-      // if it has a callback registered, execute that
-      php_printf("callback: %p\n", request);
-      while (request) {
-        php_printf("%d == %d\n", request->id, cursor->recv.response_to);
-        if (request->id == cursor->recv.response_to) {
-          request->cursor = cursor;
-          if (request->callback) {
-            php_printf("in callback: %s\n", request->callback);
-            call_callback(request, le TSRMLS_CC);
-            break;
-          }
+    // if it has a callback registered, execute that
+    while (request) {
+      if (request->id == cursor->recv.response_to) {
+        request->cursor = cursor;
+        if (request->callback) {
+          php_printf("calling callback\n");
+          call_callback(request, le TSRMLS_CC);
+          break;
         }
-        request = request->next;
       }
+      request = request->next;
+    }
   }
 }
 
@@ -1106,7 +1103,6 @@ static void connect_already(INTERNAL_FUNCTION_PARAMETERS, zval *errmsg) {
   temp_arg->link = link;
   temp_arg->tsrmls_cc = TSRMLS_C;
   pthread_create(&thread_id, NULL, (void*)db_listener, (void*)temp_arg);
-  php_printf("sock: %d\n", link->server_set->server[0]->socket);
 
 
 

@@ -371,9 +371,16 @@ PHP_METHOD(MongoCursor, async) {
 
   // check if the callbacks persistent resource exists
   if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == FAILURE) {
+    zend_rsrc_list_entry le;
+
     // if it doesn't, create it
     request->next = request->prev = 0;
-    ZEND_REGISTER_RESOURCE(NULL, request, le_requests);
+
+    le.ptr = request;
+    le.type = le_requests;
+    le.refcount = 1;
+
+    zend_hash_add(&EG(persistent_list), "requests", strlen("requests")+1, &le, sizeof(list_entry), NULL);
   }
   else {
     mongo_request *temp;
@@ -391,7 +398,6 @@ PHP_METHOD(MongoCursor, async) {
 
   send_query(getThis(), return_value TSRMLS_CC);
   request->id = cursor->send.request_id;
-  php_printf("{id : %d, func : %s (%p)}\n", request->id, request->callback, request->callback);
 }
 /* }}} */
 
@@ -523,7 +529,7 @@ static mongo_cursor* send_query(zval *this_ptr, zval *return_value TSRMLS_DC) {
 
   MAKE_STD_ZVAL(temp);
   ZVAL_NULL(temp);
-  php_printf("sending\n");
+
   sent = mongo_say(cursor->link, &buf, temp TSRMLS_CC);
   efree(buf.start);
   if (sent == FAILURE) {
