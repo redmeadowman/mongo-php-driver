@@ -1,5 +1,5 @@
 /**
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009-2010 10gen, Inc.
  * 
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,18 +18,22 @@
 #ifndef PHP_MONGO_H
 #define PHP_MONGO_H 1
 
-#define PHP_MONGO_VERSION "1.0"
+#define PHP_MONGO_VERSION "1.0.9"
 #define PHP_MONGO_EXTNAME "mongo"
 
 // resource names
 #define PHP_CONNECTION_RES_NAME "mongo connection"
-#define PHP_REQUEST_RES_NAME "mongo request list"
-
+#define PHP_CURSOR_LIST_RES_NAME "cursor list"
 
 #ifdef WIN32
 #  ifndef int64_t
      typedef __int64 int64_t;
 #  endif
+#endif
+
+#ifdef DEBUG
+#define DEBUG_CONN
+#define DEBUG_CURSOR
 #endif
 
 // db ops
@@ -51,9 +55,12 @@
 #define REPLY_HEADER_SIZE (MSG_HEADER_SIZE+20)
 #define INITIAL_BUF_SIZE 4096
 // should only be 4Mb
-#define MAX_RESPONSE_LEN 5242880
+#define MAX_RESPONSE_LEN 67108864
 #define MAX_OBJECT_LEN 4194304
 #define DEFAULT_CHUNK_SIZE (256*1024)
+#define INVALID_STRING_LEN(len) (len < 0 || len > MAX_RESPONSE_LEN)
+
+#define PHP_MONGO_DEFAULT_TIMEOUT 10000
 
 // if _id field should be added
 #define PREP 1
@@ -74,14 +81,14 @@
 
 #if ZEND_MODULE_API_NO >= 20090115
 # define PUSH_PARAM(arg) zend_vm_stack_push(arg TSRMLS_CC)
-# define POP_PARAM() zend_vm_stack_pop(TSRMLS_C)
+# define POP_PARAM() (void)zend_vm_stack_pop(TSRMLS_C)
 # define PUSH_EO_PARAM()
 # define POP_EO_PARAM()
 #else
 # define PUSH_PARAM(arg) zend_ptr_stack_push(&EG(argument_stack), arg)
-# define POP_PARAM() zend_ptr_stack_pop(&EG(argument_stack))
+# define POP_PARAM() (void)zend_ptr_stack_pop(&EG(argument_stack))
 # define PUSH_EO_PARAM() zend_ptr_stack_push(&EG(argument_stack), NULL)
-# define POP_EO_PARAM() zend_ptr_stack_pop(&EG(argument_stack))
+# define POP_EO_PARAM() (void)zend_ptr_stack_pop(&EG(argument_stack))
 #endif
 
 #if ZEND_MODULE_API_NO >= 20060613
@@ -163,12 +170,15 @@ typedef struct _mongo_server {
   char *host;
   int port;
   int socket;
+  int domain_socket;
   int connected;
+
+  struct _mongo_server *next;
 } mongo_server;
 
 typedef struct _mongo_server_set {
   int num;
-  mongo_server **server;
+  mongo_server *server;
 
   /*
    * this is the resource id if this is a persistent connection, so that we can
@@ -176,8 +186,10 @@ typedef struct _mongo_server_set {
    */
   int rsrc;
 
-  // if num is greater than -1, master keeps track of the master connection
-  int master;
+  // if num is greater than -1, master keeps track of the master connection,
+  // otherwise it points to "server"
+  mongo_server *master;
+  mongo_server *eo_seeds;
 } mongo_server_set;
 
 typedef struct {
@@ -186,15 +198,25 @@ typedef struct {
   // ts keeps track of the last time we tried to connect, so we don't try to
   // reconnect a zillion times in three seconds.
   int ts;
+  int timeout;
 
   int persist;
 
   mongo_server_set *server_set;
+  // if this is a replica set
+  int rs;
 
-  char *username;
-  char *password;
+  zval *db;
+  zval *username;
+  zval *password;
 
 } mongo_link;
+
+
+#define MONGO_LINK 0
+#define MONGO_CURSOR 1
+
+int php_mongo_free_cursor_le(void*, int TSRMLS_DC);
 
 
 typedef struct {
@@ -205,9 +227,9 @@ typedef struct {
 } mongo_msg_header;
 
 typedef struct {
-  unsigned char *start;
-  unsigned char *pos;
-  unsigned char *end;
+  char *start;
+  char *pos;
+  char *end;
 } buffer;
 
 #define CREATE_MSG_HEADER(rid, rto, opcode)     \
@@ -228,16 +250,16 @@ typedef struct {
   CREATE_RESPONSE_HEADER(buf, ns, 0, opcode);                    
 
 
-#define APPEND_HEADER(buf, opts) buf.pos += INT_32;     \
-  php_mongo_serialize_int(&buf, header.request_id);     \
-  php_mongo_serialize_int(&buf, header.response_to);    \
-  php_mongo_serialize_int(&buf, header.op);             \
-  php_mongo_serialize_int(&buf, opts);                                
+#define APPEND_HEADER(buf, opts) buf->pos += INT_32;     \
+  php_mongo_serialize_int(buf, header.request_id);     \
+  php_mongo_serialize_int(buf, header.response_to);    \
+  php_mongo_serialize_int(buf, header.op);             \
+  php_mongo_serialize_int(buf, opts);                                
 
 
 #define APPEND_HEADER_NS(buf, ns, opts)                         \
   APPEND_HEADER(buf, opts);                                     \
-  php_mongo_serialize_ns(&buf, ns TSRMLS_CC);
+  php_mongo_serialize_ns(buf, ns TSRMLS_CC);
 
 
 #define MONGO_CHECK_INITIALIZED(member, class_name)                     \
@@ -251,6 +273,93 @@ typedef struct {
     zend_throw_exception(mongo_ce_Exception, "The " #class_name " object has not been correctly initialized by its constructor", 0 TSRMLS_CC); \
     RETURN_STRING("", 1);                                               \
   }
+
+#define PHP_MONGO_GET_LINK(obj)                                         \
+  link = (mongo_link*)zend_object_store_get_object((obj) TSRMLS_CC);    \
+  MONGO_CHECK_INITIALIZED(link->server_set, Mongo);
+
+#define PHP_MONGO_GET_DB(obj)                                           \
+  db = (mongo_db*)zend_object_store_get_object((obj) TSRMLS_CC);        \
+  MONGO_CHECK_INITIALIZED(db->name, MongoDB);
+
+#define PHP_MONGO_GET_COLLECTION(obj)                                   \
+  c = (mongo_collection*)zend_object_store_get_object((obj) TSRMLS_CC); \
+  MONGO_CHECK_INITIALIZED(c->ns, MongoCollection);
+
+#define PHP_MONGO_GET_CURSOR(obj)                                       \
+  cursor = (mongo_cursor*)zend_object_store_get_object((obj) TSRMLS_CC); \
+  MONGO_CHECK_INITIALIZED(cursor->link, MongoCursor);
+
+#define PHP_MONGO_CHECK_EXCEPTION() if (EG(exception)) { return; }
+#define PHP_MONGO_CHECK_EXCEPTION1(arg1)                        \
+  if (EG(exception)) {                                          \
+    zval_ptr_dtor(arg1);                                        \
+    return;                                                     \
+  }
+#define PHP_MONGO_CHECK_EXCEPTION2(arg1, arg2)                  \
+  if (EG(exception)) {                                          \
+    zval_ptr_dtor(arg1);                                        \
+    zval_ptr_dtor(arg2);                                        \
+    return;                                                     \
+  }
+#define PHP_MONGO_CHECK_EXCEPTION3(arg1, arg2, arg3)            \
+  if (EG(exception)) {                                          \
+    zval_ptr_dtor(arg1);                                        \
+    zval_ptr_dtor(arg2);                                        \
+    zval_ptr_dtor(arg3);                                        \
+    return;                                                     \
+  }
+#define PHP_MONGO_CHECK_EXCEPTION4(arg1, arg2, arg3, arg4)      \
+  if (EG(exception)) {                                          \
+    zval_ptr_dtor(arg1);                                        \
+    zval_ptr_dtor(arg2);                                        \
+    zval_ptr_dtor(arg3);                                        \
+    zval_ptr_dtor(arg4);                                        \
+    return;                                                     \
+  }
+
+#define PHP_MONGO_SERIALIZE_KEY(type)                           \
+  php_mongo_set_type(buf, type);                                \
+  php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC); \
+  if (EG(exception)) {                                          \
+    return ZEND_HASH_APPLY_STOP;                                \
+  }
+
+#define SEND_MSG                                                \
+  PHP_MONGO_GET_LINK(c->link);                                  \
+  if (safe) {                                                           \
+    zval *cursor;                                                       \
+    if (0 == (cursor = append_getlasterror(getThis(), &buf, safe, fsync TSRMLS_CC))) { \
+      zval_ptr_dtor(&cursor);                                           \
+      RETURN_FALSE;                                                     \
+    }                                                                   \
+                                                                        \
+    safe_op(link, cursor, &buf, return_value TSRMLS_CC);                \
+  }                                                             \
+  else {                                                        \
+    zval *temp;                                                 \
+    MAKE_STD_ZVAL(temp);                                        \
+    ZVAL_NULL(temp);                                            \
+                                                                \
+    RETVAL_BOOL(mongo_say(link, &buf, temp TSRMLS_CC)+1);       \
+    zval_ptr_dtor(&temp);                                       \
+  }
+
+#define GET_SAFE_OPTION                                                 \
+  if (options && !IS_SCALAR_P(options)) {                               \
+    zval **safe_pp, **fsync_pp;                                         \
+                                                                        \
+    if (SUCCESS == zend_hash_find(HASH_P(options), "safe", strlen("safe")+1, (void**)&safe_pp)) { \
+      safe = Z_BVAL_PP(safe_pp);                                        \
+    }                                                                   \
+    if (SUCCESS == zend_hash_find(HASH_P(options), "fsync", strlen("fysnc")+1, (void**)&fsync_pp)) { \
+      fsync = Z_BVAL_PP(fsync_pp);                                      \
+      if (fsync && !safe) {                                             \
+        safe = 1;                                                       \
+      }                                                                 \
+    }                                                                   \
+  }
+
 
 #define REPLY_HEADER_LEN 36
 
@@ -294,6 +403,25 @@ typedef struct {
 
 } mongo_cursor;
 
+/*
+ * unfortunately, cursors can be freed before or after link is destroyed, so 
+ * we can't actually depend on having a link to the database.  So, we're 
+ * going to keep a separate list of link ids associated with cursor ids.
+ *
+ * When a cursor is to be freed, we try to find this cursor in the list.  If 
+ * it's there, kill it.  If not, the db connection is probably already dead.
+ * 
+ * When a connection is killed, we sweep through the list and kill all the
+ * cursors for that link.
+ */
+typedef struct _cursor_node {
+  mongo_cursor *cursor;
+
+  struct _cursor_node *next;
+  struct _cursor_node *prev;
+} cursor_node;
+
+void php_mongo_free_cursor_node(cursor_node*, list_entry*);
 
 typedef struct _mongo_request {
   int id;
@@ -329,9 +457,7 @@ typedef struct {
 
   // parent database
   zval *parent;
-
-  // db obj
-  mongo_db *db;
+  zval *link;
 
   // names
   zval *name;
@@ -342,15 +468,10 @@ typedef struct {
 #define BUF_REMAINING (buf->end-buf->pos)
 
 #define CREATE_BUF(buf, size)                   \
-  buf.start = (unsigned char*)emalloc(size);    \
+  buf.start = (char*)emalloc(size);             \
   buf.pos = buf.start;                          \
   buf.end = buf.start + size;
 
-#define DEBUG_BUF(buf)                              \
-  unsigned char *temp = buf.start;                  \
-  while(temp != buf.pos) {                          \
-    php_printf("%d\n", *temp++);                    \
-  }
 
 PHP_MINIT_FUNCTION(mongo);
 PHP_MSHUTDOWN_FUNCTION(mongo);
@@ -382,6 +503,69 @@ PHP_METHOD(Mongo, prevError);
 PHP_METHOD(Mongo, resetError);
 PHP_METHOD(Mongo, forceError);
 PHP_METHOD(Mongo, close);
+PHP_METHOD(Mongo, listDBs);
+
+int php_mongo_create_le(mongo_cursor *cursor, char *name TSRMLS_DC);
+
+/*
+ * Mutex macros
+ */
+
+#ifdef WIN32
+#define LOCK {                                  \
+    int ret = -1;                               \
+    int tries = 0;                              \
+                                                \
+    while (tries++ < 3 && ret != 0) {                 \
+      ret = WaitForSingleObject(cursor_mutex, 5000);  \
+      if (ret != 0) {                                 \
+        if (ret == WAIT_TIMEOUT) {                    \
+          continue;                                   \
+        }                                             \
+        else {                                                          \
+          zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "mutex error: %s", strerror(GetLastError())); \
+          return ret;                                                   \
+        }                                                               \
+      }                                                                 \
+    }                                                                   \
+  }
+#define UNLOCK {                                       \
+    int ret = ReleaseMutex(cursor_mutex);              \
+    if (ret == 0) {                                                     \
+      zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "mutex error: %s", strerror(GetLastError())); \
+      return ret;                                                       \
+    }                                                                   \
+  }
+#else
+#define CHECK_LOCK_ERR                          \
+  if (ret == -1) {                              \
+    if (errno == EAGAIN || errno == EBUSY) {    \
+      continue;                                 \
+    }                                           \
+    else {                                      \
+      zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "mutex error: %d", strerror(errno)); \
+      return ret;                               \
+    }                                           \
+  }
+#define LOCK {                                  \
+    int ret = -1;                               \
+    int tries = 0;                              \
+                                                \
+    while (tries++ < 3 && ret != 0) {                     \
+      ret = pthread_mutex_lock(&cursor_mutex);            \
+      CHECK_LOCK_ERR;                                     \
+    }                                                     \
+  }
+#define UNLOCK {                                    \
+    int ret = -1;                                   \
+    int tries = 0;                                  \
+                                                    \
+    while (tries++ < 3 && ret != 0) {               \
+      ret = pthread_mutex_unlock(&cursor_mutex);    \
+      CHECK_LOCK_ERR;                               \
+    }                                               \
+  }
+#endif
 
 
 /*
@@ -390,7 +574,7 @@ PHP_METHOD(Mongo, close);
 void mongo_do_up_connect_caller(INTERNAL_FUNCTION_PARAMETERS);
 void mongo_do_connect_caller(INTERNAL_FUNCTION_PARAMETERS, zval *username, zval *password);
 int mongo_say(mongo_link*, buffer*, zval* TSRMLS_DC);
-int mongo_hear(mongo_link*, void*, int TSRMLS_DC);
+int mongo_hear(int sock, void*, int TSRMLS_DC);
 int php_mongo_get_reply(mongo_cursor*, zval* TSRMLS_DC);
 
 void mongo_init_Mongo(TSRMLS_D);
@@ -409,26 +593,29 @@ void mongo_init_MongoDate(TSRMLS_D);
 void mongo_init_MongoBinData(TSRMLS_D);
 void mongo_init_MongoDBRef(TSRMLS_D);
 void mongo_init_MongoTimestamp(TSRMLS_D);
-
+void mongo_init_MongoInt32(TSRMLS_D);
+void mongo_init_MongoInt64(TSRMLS_D);
 
 ZEND_BEGIN_MODULE_GLOBALS(mongo)
-long num_links,num_persistent;
-long max_links,max_persistent;
-long allow_persistent; 
 int auto_reconnect; 
+int allow_persistent; 
 char *default_host; 
 int default_port;
 int request_id; 
 int chunk_size;
-
 // $ alternative
 char *cmd_char;
+int utf8;
+int native_long;
+int long_as_object;
 
 // _id generation helpers
 int inc, pid, machine;
 
 // timestamp generation helper
 int ts_inc;
+char *errmsg;
+int response_num;
 ZEND_END_MODULE_GLOBALS(mongo) 
 
 #ifdef ZTS

@@ -8,7 +8,7 @@ require_once 'PHPUnit/Framework.php';
 class MongoTest extends PHPUnit_Framework_TestCase
 {
     public function testVersion() {
-        $this->assertEquals("1.0.2", Mongo::VERSION);
+        $this->assertEquals("1.0.9", Mongo::VERSION);
     }
 
     /**
@@ -46,6 +46,12 @@ class MongoTest extends PHPUnit_Framework_TestCase
     public function testConnect2() {
         $this->object = new Mongo("localhost", array("connect" => false));
         $this->assertFalse($this->object->connected);
+    }
+
+    public function testSpaceChomp() {
+      $m = new Mongo("localhost:27018, localhost");
+      $m = new Mongo("localhost:27018,    localhost, localhost:27019");
+      $m = new Mongo("localhost:27018, localhost, ");
     }
 
     /**
@@ -116,6 +122,16 @@ class MongoTest extends PHPUnit_Framework_TestCase
         $this->assertEquals("localhost:27017", (string)$m);
     }
 
+    public function test__toString2() {
+        $m = new Mongo("mongodb://localhost:27018,localhost:27017,localhost:27019");
+        $this->assertEquals("localhost:27017,[localhost:27018],[localhost:27019]", $m->__toString());
+        $this->assertEquals(51, strlen($m->__toString()));
+
+        // realloc
+        $m = new Mongo("mongodb://localhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhosta:27018,localhost:27017");
+        $this->assertEquals("localhost:27017,[localhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhostalocalhosta:27018]", $m->__toString());
+        $this->assertEquals(274, strlen($m->__toString()));
+    }
 
     /**
      * @expectedException Exception
@@ -171,10 +187,6 @@ class MongoTest extends PHPUnit_Framework_TestCase
         $this->assertEquals((string)$db, "[x,y]");
         $db = $this->object->selectDB(4);
         $this->assertEquals((string)$db, "4");
-        $db = $this->object->selectDB("/");
-        $this->assertEquals((string)$db, "/");
-        $db = $this->object->selectDB("\"");
-        $this->assertEquals((string)$db, "\"");
     }
 
     /**
@@ -193,7 +205,7 @@ class MongoTest extends PHPUnit_Framework_TestCase
 
         $c = $this->object->selectCollection("foo", "bar.baz");
         $this->assertEquals((string)$c, "foo.bar.baz");
-        $c = $this->object->selectCollection(1, 6);
+        $c = $this->object->selectCollection("1", "6");
         $this->assertEquals((string)$c, "1.6"); 
         $c = $this->object->selectCollection("foo", '$cmd');
         $this->assertEquals((string)$c, 'foo.$cmd');
@@ -222,13 +234,13 @@ class MongoTest extends PHPUnit_Framework_TestCase
         $err = $this->sharedFixture->lastError();
         $this->assertEquals(null, $err['err'], json_encode($err));
         $this->assertEquals(0, $err['n'], json_encode($err));
-        $this->assertEquals(1, $err['ok'], json_encode($err));
+        $this->assertEquals(true, (bool)$err['ok'], json_encode($err));
 
         $this->sharedFixture->forceError();
         $err = $this->sharedFixture->lastError();
         $this->assertNotNull($err['err']);
         $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['ok'], 1);
+        $this->assertEquals((bool)$err['ok'], true);
     }
 
     /**
@@ -240,14 +252,14 @@ class MongoTest extends PHPUnit_Framework_TestCase
         $this->assertEquals($err['err'], null);
         $this->assertEquals($err['n'], 0);
         $this->assertEquals($err['nPrev'], -1);
-        $this->assertEquals($err['ok'], 1);
+        $this->assertEquals((bool)$err['ok'], true);
         
         $this->sharedFixture->forceError();
         $err = $this->sharedFixture->prevError();
         $this->assertNotNull($err['err']);
         $this->assertEquals($err['n'], 0);
         $this->assertEquals($err['nPrev'], 1);
-        $this->assertEquals($err['ok'], 1);
+        $this->assertEquals((bool)$err['ok'], true);
     }
 
     /**
@@ -258,7 +270,7 @@ class MongoTest extends PHPUnit_Framework_TestCase
         $err = $this->sharedFixture->lastError();
         $this->assertEquals($err['err'], null);
         $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['ok'], 1);
+        $this->assertEquals((bool)$err['ok'], true);
     }
 
     /**
@@ -269,7 +281,7 @@ class MongoTest extends PHPUnit_Framework_TestCase
         $err = $this->sharedFixture->lastError();
         $this->assertNotNull($err['err']);
         $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['ok'], 1);
+        $this->assertEquals((bool)$err['ok'], true);
     }
 
     public function testClose() {
@@ -398,10 +410,100 @@ class MongoTest extends PHPUnit_Framework_TestCase
         $start = memory_get_usage(true);
 
         for ($i=0; $i<100; $i++) {
-          $t = new StaticFunctionTest();
-          $t::connect();
+          StaticFunctionTest::connect();
         }
         $this->assertEquals($start, memory_get_usage(true));
+    }
+
+
+    public function testListDBs() {
+        $dbs = $this->sharedFixture->listDBs();
+        $this->assertEquals(true, (bool)$dbs['ok'], json_encode($dbs));
+        $this->assertTrue(array_key_exists('databases', $dbs));
+    }
+
+    /*
+     * our current test framework can't really test this, so this just passes
+     * a couple options and checks things don't explode.
+     */
+    public function testTimeout() {
+      $m = new Mongo("localhost", array("timeout" => 0));
+      $m = new Mongo("localhost", array("timeout" => 200000));
+      $m = new Mongo("localhost", array("timeout" => -2));
+      $m = new Mongo("localhost", array("timeout" => "foo"));
+      $m = new Mongo("localhost", array("timeout" => array("x" => 1)));
+
+      $c = $m->phpunit->c;
+      $c->drop();
+      $c->insert(array("x" => 1));
+      $obj = $c->findOne();
+      $this->assertEquals(1, $obj['x']);
+    }
+
+    /*
+     * again, not really testing functionality.
+     */
+    public function testDB() {
+      $m = new Mongo("localhost/foo");
+      $m = new Mongo("localhost/bar/baz");
+      $m = new Mongo("localhost/");
+    }
+
+    /*
+     * test with ports
+     */
+    public function testDBPorts() {
+      $m = new Mongo("localhost:27017/foo");
+      $m = new Mongo("localhost:27017/bar/baz");
+      $m = new Mongo("localhost:27017/");
+      $m = new Mongo("localhost:27017,localhost:27019/");
+    }
+
+    /*
+     * regression
+     */
+    public function testGetter() {
+      if (preg_match($this->sharedFixture->version_51, phpversion())) {
+        $this->markTestSkipped("No implicit __toString in 5.1");
+        return;
+      }
+
+      $db = $this->object->selectDB('db');
+      $this->assertEquals('db', $db->__toString());
+      $db = $this->object->selectDB($db);
+      $this->assertEquals('db', $db->__toString());
+    }
+
+    public function testGetter2() {
+      if (preg_match($this->sharedFixture->version_51, phpversion())) {
+        $this->markTestSkipped("No implicit __toString in 5.1");
+        return;
+      }
+
+      $db = $this->object->__get('db');
+      $this->assertEquals('db', $db->__toString());
+      $db = $this->object->__get($db);
+      $this->assertEquals('db', $db->__toString());
+    }
+
+    public function testDomainSock() {
+        $os = php_uname("s");
+        if (preg_match("/win/i", $os)) {
+            $this->markTestSkipped("No implicit __toString in 5.1");
+            return;
+        }
+
+        $conn = new Mongo("mongodb:///tmp/mongodb-27017.sock");
+        $this->assertEquals(true, $conn->connected);
+        $conn = new Mongo("mongodb:///tmp/mongodb-27017.sock:0/foo");
+        $this->assertEquals(true, $conn->connected);
+    }
+
+    /**
+     * @expectedException MongoConnectionException
+     */
+    public function testDomainSock2() {
+        $conn = new Mongo("mongodb:///tmp/foo");
     }
 }
 

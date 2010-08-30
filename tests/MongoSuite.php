@@ -1,7 +1,12 @@
 <?php
+
+require_once 'MongoInt32Test.php';
+require_once 'MongoInt64Test.php';
+
 require_once 'MongoTest.php';
 require_once 'MongoDBTest.php';
 require_once 'MongoCollectionTest.php';
+require_once 'MongoCollectionTest2.php';
 require_once 'MongoCursorTest.php';
 require_once 'MongoGridFSTest.php';
 require_once 'MongoGridFSFileTest.php';
@@ -17,7 +22,7 @@ require_once 'MongoTimestampTest.php';
 require_once 'MongoObjectsTest.php';
 require_once 'MongoObjDBTest.php';
 
-require_once 'MongoRegressionTest1.php';
+require_once 'RegressionTest1.php';
 
 require_once 'MongoMemTest.php';
 require_once 'CmdSymbolTest.php';
@@ -34,12 +39,13 @@ class MongoSuite extends PHPUnit_Framework_TestSuite
     public static function suite()
     {
         $suite = new MongoSuite('Mongo Tests');
-        
-        $suite->addTestSuite('MongoMemTest');
-
+      
+        $suite->addTestSuite('MongoInt32Test');
+        $suite->addTestSuite('MongoInt64Test');
         $suite->addTestSuite('MongoTest');
         $suite->addTestSuite('MongoDBTest');
         $suite->addTestSuite('MongoCollectionTest');
+        $suite->addTestSuite('MongoCollectionTest2');
         $suite->addTestSuite('MongoCursorTest');
         
         // */
@@ -62,7 +68,7 @@ class MongoSuite extends PHPUnit_Framework_TestSuite
         $suite->addTestSuite('MongoObjectsTest');
         $suite->addTestSuite('MongoObjDBTest');
         
-        $suite->addTestSuite('MongoRegressionTest1');
+        $suite->addTestSuite('RegressionTest1');
         $suite->addTestSuite('CmdSymbolTest');
         $suite->addTestSuite('SerializationTest');
 	$suite->addTestSuite('MinMaxKeyTest');
@@ -83,12 +89,6 @@ class MongoSuite extends PHPUnit_Framework_TestSuite
             echo "\nAdd \$pwd/php/ to include_path to run admin/auth tests\n";
 	  }
 	}
-
-        if (class_exists("MongoGridFSFileClassic")) {
-            $suite->addTestSuite('MongoGridFSFileClassicTest');
-        } else {
-            echo "\nAdd \$pwd/php/ to include_path to run GridFS Classic tests\n";
-        }
 
         // */
         return $suite;
@@ -118,6 +118,8 @@ class MongoSuite extends PHPUnit_Framework_TestSuite
         }
 
         $this->sharedFixture->version_51 = "/5\.1\../";
+
+        var_dump($this->sharedFixture->listDBs());
     }
  
     protected function tearDown()

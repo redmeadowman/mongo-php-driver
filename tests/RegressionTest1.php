@@ -1,7 +1,7 @@
 <?php
 require_once 'PHPUnit/Framework.php';
 
-class MongoRegressionTest1 extends PHPUnit_Framework_TestCase
+class RegressionTest1 extends PHPUnit_Framework_TestCase
 {
 
     /**
@@ -34,6 +34,14 @@ class MongoRegressionTest1 extends PHPUnit_Framework_TestCase
         $c->insert(array('_id' => 1));
         $obj = $c->findOne();
         $this->assertEquals($obj['_id'], 1);
+    }
+
+    /**
+     * @expectedException MongoException
+     */
+    public function testTinyInsert2() {
+        $c = $this->sharedFixture->selectCollection("phpunit", "c");
+        $c->drop();
 
         $c->remove();
         $c->insert(array());
@@ -240,7 +248,8 @@ class MongoRegressionTest1 extends PHPUnit_Framework_TestCase
       }
 
       $cursor = $c->find();
-      $this->assertTrue(is_int($cursor->count()));
+      $x = $cursor->count();
+      $this->assertTrue(is_int($x), $x);
 
       $cursor->limit(4);
       $this->assertTrue(is_int($cursor->count()));
@@ -286,5 +295,158 @@ class MongoRegressionTest1 extends PHPUnit_Framework_TestCase
       $this->assertNull($x->getSize());
     }
 
+    public function testCryllic() {
+      $c = $this->sharedFixture->phpunit->c;
+      try { 
+        $c->insert(array("x" => "\xC3\x84"));
+      }
+      catch (MongoException $e) {
+        $this->assertTrue(false, $e);
+      }
+    }
+
+    public function testEmptyQuery() {
+      $c = $this->sharedFixture->phpunit->c;
+      $c->drop();
+
+      for ($i=0; $i<10; $i++) {
+        $c->insert(array("x" => $i));
+      }
+      
+      $cursor = $c->find(array(), array("x" => 1))->sort(array("x" => 1));
+
+      $count = 0;
+      foreach ($cursor as $doc) {
+        $count++;
+      }
+      $this->assertEquals(10, $count);
+    }
+
+    /**
+     * @expectedException MongoException
+     */
+    public function testNonUTF81() {
+      $c = $this->sharedFixture->phpunit->c;
+      $c->insert(array("x" => "\xFE"));
+    }
+
+    public function testNonUTF82() {
+      $c = $this->sharedFixture->phpunit->c;
+      ini_set("mongo.utf8", 0);
+      $c->insert(array("x" => "\xFE"));
+      ini_set("mongo.utf8", 1);
+      $c->drop();
+    }
+
+    /**
+     * @expectedException MongoConnectionException
+     */
+    public function testNoPassword1() {
+      new Mongo("mongodb://admin@anyhost-and-nonexistent");
+    }
+
+    /**
+     * @expectedException MongoConnectionException
+     */
+    public function testNoPassword2() {
+      new Mongo("mongodb://admin@anyhost-and-nonexistent:foo");
+    }
+
+    /**
+     * @expectedException MongoConnectionException
+     */
+    public function testNoPassword3() {
+      new Mongo("mongodb://admin@anyhost-and-nonexistent:27017");
+    }
+
+    /**
+     * @expectedException MongoConnectionException
+     */
+    public function testNoPassword4() {
+      new Mongo("mongodb://@anyhost-and-nonexistent:27017");
+    }
+
+    /**
+     * @expectedException MongoConnectionException
+     */
+    public function testNoPassword5() {
+      new Mongo("mongodb://:@anyhost-and-nonexistent");
+    }
+
+    public function testFatalRecursion() {
+        if (preg_match($this->sharedFixture->version_51, phpversion())) {
+            $this->markTestSkipped('annoying output in 5.1.');
+            return;
+        }
+
+        $output = "";
+        $exit_code = 0;
+        exec("php tests/fatal4.php", $output, $exit_code);
+        $msg = "Fatal error: Nesting level too deep";
+
+        if (count($output) > 0) {
+            $this->assertEquals($msg, substr($output[1], 0, strlen($msg)), json_encode($output)); 
+        }
+    }
+
+    public function testStaticDtor() {
+        $f = new Foo2();
+        $f->f();
+    }
+
+    public function testGetMore() {
+      $c = $this->sharedFixture->phpunit->c;
+      
+      for($i=0; $i<500; $i++) {
+        $c->insert(array("x" => new MongoDate(), "count" => $i, "my string" => "doo dee doo"));
+      }
+
+      $cursor = $c->find();
+      foreach ($cursor as $v) {
+      }
+    }
+
+    /**
+     * @expectedException MongoException
+     */
+    public function testNonUTF8Embed() {
+      $this->sharedFixture->phpunit->c->insert(array('x'=>array("y" => "\xFF"), "y" => array()));
+    }
+
+    /**
+     * @expectedException MongoConnectionException
+     */
+    public function testInvalidConnectionSyntax() {
+      $m = new Mongo("mongodb://name:password@localhost/");
+    }
+
+    /**
+     * @expectedException MongoException
+     */
+    public function testTooBigInsert() {
+      if (preg_match($this->sharedFixture->version_51, phpversion())) {
+        $this->markTestSkipped('annoying output in 5.1.');
+        return;
+      }
+
+      $contents = file_get_contents('tests/pycon-poster.pdf');
+
+      $arr = array();
+      for ($i=0; $i<7; $i++) {
+        $arr[] = array("content" => new MongoBinData($contents), "i" => $i);
+      }
+
+      $this->sharedFixture->phpunit->c->batchInsert($arr);
+    }
 }
+
+class Foo2 {
+  static $c;
+  public function f() {
+    $m = new Mongo();
+    $db = new MongoDB($m, 'foo');
+    Foo2::$c = new MongoCollection($db, 'bar');
+  }
+}
+
 ?>

@@ -1,6 +1,6 @@
 //cursor.h
 /**
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009-2010 10gen, Inc.
  * 
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ PHP_METHOD(MongoCursor, getNext);
 PHP_METHOD(MongoCursor, hasNext);
 PHP_METHOD(MongoCursor, limit);
 PHP_METHOD(MongoCursor, skip);
+PHP_METHOD(MongoCursor, fields);
 PHP_METHOD(MongoCursor, slaveOkay);
 PHP_METHOD(MongoCursor, tailable);
 PHP_METHOD(MongoCursor, immortal);
@@ -34,6 +35,7 @@ PHP_METHOD(MongoCursor, dead);
 PHP_METHOD(MongoCursor, snapshot);
 PHP_METHOD(MongoCursor, sort);
 PHP_METHOD(MongoCursor, hint);
+PHP_METHOD(MongoCursor, addOption);
 PHP_METHOD(MongoCursor, explain);
 PHP_METHOD(MongoCursor, doQuery);
 PHP_METHOD(MongoCursor, current);
@@ -43,6 +45,7 @@ PHP_METHOD(MongoCursor, rewind);
 PHP_METHOD(MongoCursor, valid);
 PHP_METHOD(MongoCursor, reset);
 PHP_METHOD(MongoCursor, count);
+PHP_METHOD(MongoCursor, info);
 
 #define preiteration_setup   zval *z = 0;                               \
   mongo_cursor *cursor = (mongo_cursor*)zend_object_store_get_object(getThis() TSRMLS_CC); \

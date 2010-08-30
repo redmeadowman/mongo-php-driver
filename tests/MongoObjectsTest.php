@@ -106,12 +106,12 @@ class MongoObjectsTest extends PHPUnit_Framework_TestCase
 
     public function testValidate() {
         $v = $this->object->validate();
-        $this->assertEquals($v['ok'], 0);
+        $this->assertEquals((bool)$v['ok'], false);
         $this->assertEquals('ns not found', $v['errmsg']);
         
         $this->object->insert((object)array('a' => 'foo'));
         $v = $this->object->validate();
-        $this->assertEquals($v['ok'], 1);
+        $this->assertEquals((bool)$v['ok'], true);
         $this->assertEquals($v['ns'], 'phpunit.c');
         $this->assertNotNull($v['result']);
     }
@@ -147,17 +147,6 @@ class MongoObjectsTest extends PHPUnit_Framework_TestCase
       $this->assertEquals($obj['string'], 'string');
     }
 
-    public function testInsert2() {
-      $this->assertTrue($this->object->insert((object)array(NULL)));
-      $this->assertTrue($this->object->insert((object)array(NULL=>"1")));
-      
-      $this->assertEquals($this->object->count(), 2);
-      $cursor = $this->object->find();
-
-      $x = $cursor->getNext();
-      $x = $cursor->getNext();
-    }
-
     public function testInsertNonAssoc() {
         if (preg_match($this->sharedFixture->version_51, phpversion())) {
             $this->markTestSkipped("No implicit __toString in 5.1");
@@ -175,17 +164,13 @@ class MongoObjectsTest extends PHPUnit_Framework_TestCase
     }
     
     public function testBatchInsert() {
-      $this->assertFalse($this->object->batchInsert(array()));
-      $this->assertFalse($this->object->batchInsert(array(1,2,3)));
       $this->assertTrue($this->object->batchInsert(array('z'=>(object)array('foo'=>'bar'))));
 
       $a = array( (object)array( "x" => "y"), (object)array( "x"=> "z"), (object)array("x"=>"foo"));
       $this->object->batchInsert($a);
       $this->assertEquals(4, $this->object->count());
 
-      $cursor = $this->object->find()->sort((object)array("x" => -1));
-      $x = $cursor->getNext();
-      $this->assertEquals('bar', $x['foo']);
+      $cursor = $this->object->find(array("x"=>array('$exists' => 1)))->sort((object)array("x" => -1));
       $x = $cursor->getNext();
       $this->assertEquals('z', $x['x']);
       $x = $cursor->getNext();

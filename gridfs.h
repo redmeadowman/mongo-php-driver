@@ -1,6 +1,6 @@
 //gridfs.h
 /**
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009-2010 10gen, Inc.
  * 
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,9 @@ PHP_METHOD(MongoGridFS, findOne);
 PHP_METHOD(MongoGridFS, remove);
 PHP_METHOD(MongoGridFS, storeUpload);
 PHP_METHOD(MongoGridFS, storeBytes);
+PHP_METHOD(MongoGridFS, get);
+PHP_METHOD(MongoGridFS, put);
+PHP_METHOD(MongoGridFS, delete);
 
 PHP_METHOD(MongoGridFSFile, __construct);
 PHP_METHOD(MongoGridFSFile, getFilename);

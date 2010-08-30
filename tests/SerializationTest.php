@@ -3,6 +3,24 @@ require_once 'PHPUnit/Framework.php';
 
 class SerializationTest extends PHPUnit_Framework_TestCase
 {
+    public function arrayEncode() {
+      $c = $this->sharedFixture->phpunit->c->drop();
+
+      $a = array();
+      $a[-1] = 'foo';
+      $c->insert($a);
+      $a2 = $c->findOne();
+      $this->assertEquals('foo', $a2['-1'], json_encode($a2));
+
+      $c->remove();
+      $a[-2147483647] = "bar";
+
+      $c->insert($a);
+      $a2 = $c->findOne();
+      
+      $this->assertEquals('bar', $a2['-2147483647'], json_encode($a2));
+    }
+
     public function getChars($x) {
       $str = "";
       for ($i=0; $i < strlen($x); $i++) {
@@ -96,6 +114,81 @@ class SerializationTest extends PHPUnit_Framework_TestCase
     public function testRegex() {
       $x = bson_encode(NULL);
       $this->assertEquals("", $x);
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testUpdateFree() {
+      $c = $this->sharedFixture->phpunit->c;
+      $c->update(array("foo" => "\xFE\xF0"), array("foo" => "\xFE\xF0"));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testRemoveFree() {
+      $c = $this->sharedFixture->phpunit->c;
+      $c->remove(array("foo" => "\xFE\xF0"));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testIdUTF8() {
+      $c = $this->sharedFixture->phpunit->c;
+      $c->insert(array("_id" => "\xFE\xF0"));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testCodeUTF8() {
+      $code = new MongoCode("return 4;", array("x" => "\xFE\xF0"));
+      $c = $this->sharedFixture->phpunit->c;
+      $c->insert(array("x" => $code));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testClassUTF8() {
+      $cls = new StdClass;
+      $cls->x = "\xFE\xF0";
+      $c = $this->sharedFixture->phpunit->c;
+      $c->insert(array("x" => $cls));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testDots() {
+      $c = $this->sharedFixture->phpunit->c;
+      $c->insert(array("x.y" => 'yz'));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testEmptyKey1() {
+        $c = $this->sharedFixture->phpunit->c;
+        $c->save(array("" => "foo"));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testEmptyKey2() {
+        $c = $this->sharedFixture->phpunit->c;
+        $c->save(array("x" => array("" => "foo")));
+    }
+
+    /**
+     * @expectedException MongoException 
+     */
+    public function testEmptyKey3() {
+        $c = $this->sharedFixture->phpunit->c;
+        $c->save(array("x" => array("" => "foo"), "y" => "z"));
     }
 }
 ?>

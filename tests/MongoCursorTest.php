@@ -30,6 +30,40 @@ class MongoCursorTest extends PHPUnit_Framework_TestCase
         //        $this->assertEquals($start, memory_get_usage(true));
     }
 
+    /**
+     * @expectedException PHPUnit_Framework_Error
+     */
+    public function test__construct() {
+      $c = $this->object->find(null);
+    }
+
+    /**
+     * @expectedException PHPUnit_Framework_Error
+     */
+    public function test__construct1() {
+      $c = $this->object->find(null, null);
+    }
+
+    /**
+     * @expectedException PHPUnit_Framework_Error
+     */
+    public function test__construct2() {
+      $c = $this->object->find(array(), null);
+    }
+
+    /**
+     * @expectedException PHPUnit_Framework_Error
+     */
+    public function test__construct3() {
+      $c = new MongoCursor($this->sharedFixture, "foo.bar", null);
+    }
+
+    /**
+     * @expectedException MongoException
+     */
+    public function test__construct4() {
+      $this->object->findOne(array(), array("id", 123));
+    }
 
     public function testHasNext() {
         $c = $this->object->find();
@@ -41,6 +75,28 @@ class MongoCursorTest extends PHPUnit_Framework_TestCase
 
         $c->getNext();
         $this->assertFalse($c->hasNext());
+    }
+
+    public function testInfo()
+    {
+        $filter = array(
+            'property1' => 'value1',
+            'property2' => array('$in' => array(1,2)),
+        );
+
+        $cursor = $this->object->find($filter);
+        $query  = $cursor->info();
+
+
+        foreach (array('limit', 'skip', 'query', 'ns') as $property) {
+            $this->assertTrue(isset($query[$property]));
+        }
+
+        $this->assertEquals($query['ns'], 'phpunit.c');
+        $this->assertEquals($query['limit'], 0);
+        $this->assertEquals($query['skip'], 0);
+        $this->assertEquals($query['query'], $filter);
+        $this->assertEquals(get_object_vars($query['fields']), array());
     }
 
     public function testGetNext() {
@@ -409,13 +465,19 @@ class MongoCursorTest extends PHPUnit_Framework_TestCase
      * BLOCKED BY: buildbot support for master/slave
      */
     public function testSlaveOkay() {
-        $cursor = $this->object->find()->slaveOkay()->tailable();
+        $this->sharedFixture->foo->drop();
+        $c = $this->sharedFixture->foo->createCollection("foo", true);
+        $c->findOne();
+
+        $cursor = $c->find()->slaveOkay()->tailable();
         $cursor->getNext();
 
         $cursor->reset();
-        $cursor = $this->object->find()->slaveOkay(false)->tailable(false);
+        $cursor = $c->find()->slaveOkay(false)->tailable(false);
         $cursor->slaveOkay(true)->tailable(true);
         $cursor->getNext();
+
+        $c->drop();
     }
 
     public function testSlaveOkay2() {
@@ -559,5 +621,176 @@ class MongoCursorTest extends PHPUnit_Framework_TestCase
       $this->assertTrue(array_key_exists('interests', $x), json_encode($x));
     }
 
+    public function testKillConnection() {
+      $m = new Mongo();
+      $c = $m->phpunit->kill;
+      $c->drop();
+
+      for($i=0; $i<10; $i++) {
+        $c->insert(array("x" => $i));
+      }
+
+      $cursor = $c->find();
+      $cursor->next();
+
+      unset($m);
+      sleep(1);
+
+      while($cursor->next()) {}
+
+      $this->sharedFixture->phpunit->kill->drop();
+    }
+
+    public function testKillCursors() {
+      $c = $this->object;
+
+      for ($i=0; $i<100; $i++) {
+        $c->insert(array("x" => $i));
+      }
+      
+      $carr = array();
+      $carr[] = $c->find(array("x" => array('$gt' => 80)));
+      $carr[] = $c->find(array("x" => array('$lt' => 40)));
+      $carr[] = $c->find(array("x" => array('$gt' => 40, '$lt' => 80)));
+
+      foreach ($carr as $cursor) {
+        $this->assertFalse($cursor->valid());
+        $cursor->next();
+        $this->assertTrue($cursor->valid());
+      }
+    }
+
+    public function testFatalForEach() {
+        if (preg_match($this->sharedFixture->version_51, phpversion())) {
+            $this->markTestSkipped("who knows what 5.1 does with fatal errors? probably something stupid.");
+            return;
+        }
+
+        $output = "";
+        $exit_code = 0;
+        exec("php tests/fatal3.php", $output, $exit_code);
+        $uncallable = "Fatal error: Call to a member function foo() on a non-object";
+
+        if (count($output) > 0) {
+            $this->assertEquals($uncallable, substr($output[1], 0, strlen($uncallable)), json_encode($output)); 
+        }
+    }
+
+    public function testManualDtor1() {
+        $mongo = new Mongo();
+        $cursor = $mongo->phpunit->c->find();
+        unset($mongo);
+        $this->assertNull($cursor->getNext());
+    }
+
+    public function testManualDtor2() {
+        $mongo = new Mongo();
+        $c = $mongo->phpunit->bar;
+        $c->insert(array("x"=>1));
+
+        $cursor = $c->find();
+        $cursor->next();
+        unset($cursor);
+        $cursor = $c->find();
+        $this->assertNotNull($cursor->getNext());
+    }
+
+    public function testAddOption() {
+        $this->object->ensureIndex(array("x" => 1));
+        for ($i=0; $i<20; $i++) {
+            $this->object->insert(array("x" => $i));
+        }
+        
+        $cursor = $this->object->find()->addOption('$min', array("x" => 15));
+        $this->assertTrue($cursor instanceof MongoCursor, get_class($cursor));
+        
+        foreach($cursor as $v) {
+            $this->assertGreaterThanOrEqual(15, $v['x']);
+        }
+    }
+
+    public function testGeoBox() {
+      $this->markTestSkipped("server bug");
+      return;
+
+      $this->object->ensureIndex(array("loc" => "2d"), array("min" => 0, "max" => 10));
+
+      for($i=1; $i<10; $i++) {
+        for ($j=1; $j<10; $j++) {
+          $this->object->insert(array("loc" => array($i, $j)));
+        }
+      }
+
+      $cursor = $this->object->find(array("loc" => array('$within' => array('$box' => array(array(4,4), array(6,6))))))->sort(array("loc" => 1));
+
+      for ($i=4; $i<7; $i++) {
+        for ($j=4; $j<7; $j++) {
+          $val = $cursor->getNext();
+          $this->assertEquals($i, $val['loc'][0]);
+          $this->assertEquals($j, $val['loc'][1]);
+        }
+      }
+    }
+      
+    public function testFields() {
+      $this->object->insert(array("x" => 1, "y" => 1));
+
+      $cursor = $this->object->find()->fields(array("x"=>1));
+      $x = $cursor->getNext();
+      $this->assertTrue(array_key_exists('x', $x));
+      $this->assertTrue(array_key_exists('_id', $x));
+      $this->assertFalse(array_key_exists('y', $x));
+
+      $cursor = $this->object->find(array(), array("y" => 1))->fields(array("x"=>1));
+      $x = $cursor->getNext();
+      $this->assertTrue(array_key_exists('x', $x));
+      $this->assertTrue(array_key_exists('_id', $x));
+      $this->assertFalse(array_key_exists('y', $x));
+      
+      $cursor = $this->object->find(array(), array("y" => 1))->fields(array("x"=>1))->fields(array("y"=>1));
+      $x = $cursor->getNext();
+      $this->assertTrue(array_key_exists('y', $x));
+      $this->assertTrue(array_key_exists('_id', $x));
+      $this->assertFalse(array_key_exists('x', $x));
+      
+      $fields = array("y" => 1);
+      $cursor = $this->object->find(array(), $fields)->fields($fields)->fields($fields);
+      $x = $cursor->getNext();
+      $this->assertTrue(array_key_exists('y', $x));
+      $this->assertTrue(array_key_exists('_id', $x));
+      $this->assertFalse(array_key_exists('x', $x));
+    }
+
+    /**
+     * @expectedException MongoCursorTimeoutException
+     */
+    public function testStaticTimeout() {
+      $this->markTestSkipped("for now");
+      return;
+
+      MongoCursor::$timeout = 1;
+
+      for ($i=0; $i<1000; $i++) {
+        $this->object->insert(array("x" => "sdfjnaireojaerkgmdfkngkdsflngklsgntoigneorisgmsrklgd$i", "y" => $i));
+      }
+
+      $rows = $this->object->find(array('$eval' => 'r = 0; cursor = db.c.find(); while (cursor.hasNext()) { x = cursor.next(); for (i=0; i<200; i++) { if (x.name == "joe"+i) { r++; } } } return r;'));
+      foreach ($rows as $row);
+
+      MongoCursor::$timeout = 30000;
+    }
+
+    public function testErrorCode() {
+        $code = 0;
+        $this->object->insert(array("_id" => 1), array("safe" => true));
+        try {
+            $this->object->insert(array("_id" => 1), array("safe" => true));
+        }
+        catch(MongoCursorException $e) {
+            $code = $e->getCode();
+        }
+
+        $this->assertEquals(11000, $code);
+    }
 }
 ?>

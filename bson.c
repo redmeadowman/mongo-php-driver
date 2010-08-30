@@ -1,6 +1,6 @@
 // bson.c
 /**
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009-2010 10gen, Inc.
  * 
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
  */
 
 #include <php.h>
+#include <zend_exceptions.h>
 
 #ifdef WIN32
 #  include <memory.h>
@@ -36,7 +37,10 @@ extern zend_class_entry *mongo_ce_BinData,
   *mongo_ce_Timestamp,
   *mongo_ce_MinKey,
   *mongo_ce_MaxKey,
-  *mongo_ce_Exception;
+  *mongo_ce_Exception,
+  *mongo_ce_CursorException,
+  *mongo_ce_Int32,
+  *mongo_ce_Int64;
 
 ZEND_EXTERN_MODULE_GLOBALS(mongo);
 
@@ -46,6 +50,7 @@ static int apply_func_args_wrapper(void **data TSRMLS_DC, int num_args, va_list 
 #else
 static int apply_func_args_wrapper(void **data, int num_args, va_list args, zend_hash_key *key);
 #endif /* ZEND_MODULE_API_NO >= 20090115 */
+static int is_utf8(const char *s, int len);
 
 
 static int prep_obj_for_db(buffer *buf, HashTable *array TSRMLS_DC) {
@@ -66,6 +71,9 @@ static int prep_obj_for_db(buffer *buf, HashTable *array TSRMLS_DC) {
   }
 
   php_mongo_serialize_element("_id", data, buf, 0 TSRMLS_CC);
+  if (EG(exception)) {
+    return FAILURE;
+  }
 
   return SUCCESS;
 }
@@ -102,8 +110,8 @@ int zval_to_bson(buffer *buf, HashTable *hash, int prep TSRMLS_DC) {
   }
 
   php_mongo_serialize_null(buf);
-  php_mongo_serialize_size(buf->start+start, buf);
-  return num;
+  php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
+  return EG(exception) ? FAILURE : num;
 }
 
 #if ZEND_MODULE_API_NO >= 20090115
@@ -112,9 +120,6 @@ static int apply_func_args_wrapper(void **data TSRMLS_DC, int num_args, va_list 
 static int apply_func_args_wrapper(void **data, int num_args, va_list args, zend_hash_key *key)
 #endif /* ZEND_MODULE_API_NO >= 20090115 */
 {
-  int retval;
-  char *name;
-
   buffer *buf = va_arg(args, buffer*);
   int prep = va_arg(args, int);
   int *num = va_arg(args, int*);
@@ -126,18 +131,39 @@ static int apply_func_args_wrapper(void **data, int num_args, va_list args, zend
   if (key->nKeyLength) {
     return php_mongo_serialize_element(key->arKey, (zval**)data, buf, prep TSRMLS_CC);
   }
+  else {
+    long current = key->h;
+    int pos = 29, negative = 0;
+    char name[30];
 
-  spprintf(&name, 0, "%ld", key->h);
-  retval = php_mongo_serialize_element(name, (zval**)data, buf, prep TSRMLS_CC);
-  efree(name);
+    // if the key is a number in ascending order, we're still
+    // dealing with an array, not an object, so increase the count
+    if (key->h == (unsigned int)*num) {
+      (*num)++;
+    }
 
-  // if the key is a number in ascending order, we're still
-  // dealing with an array, not an object, so increase the count
-  if (key->h == (unsigned int)*num) {
-    (*num)++;
+    name[pos--] = '\0';
+
+    // take care of negative indexes
+    if (current < 0) {
+      current *= -1;
+      negative = 1;
+    }
+
+    do {
+      int digit = current % 10;
+      digit += (int)'0';
+      name[pos--] = (char)digit;
+
+      current = current / 10;
+    } while (current > 0);
+
+    if (negative) {
+      name[pos--] = '-';
+    }
+
+    return php_mongo_serialize_element(name+pos+1, (zval**)data, buf, prep TSRMLS_CC);
   }
-
-  return retval;
 }
 
 int php_mongo_serialize_element(char *name, zval **data, buffer *buf, int prep TSRMLS_DC) {
@@ -149,27 +175,42 @@ int php_mongo_serialize_element(char *name, zval **data, buffer *buf, int prep T
 
   switch (Z_TYPE_PP(data)) {
   case IS_NULL:
-    php_mongo_set_type(buf, BSON_NULL);
-    php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+    PHP_MONGO_SERIALIZE_KEY(BSON_NULL);
     break;
   case IS_LONG:
-    php_mongo_set_type(buf, BSON_INT);
-    php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
-    php_mongo_serialize_int(buf, Z_LVAL_PP(data));
+    if (MonGlo(native_long)) {
+#if SIZEOF_LONG == 4
+      PHP_MONGO_SERIALIZE_KEY(BSON_INT);
+      php_mongo_serialize_int(buf, Z_LVAL_PP(data));
+#else
+# if SIZEOF_LONG == 8
+      PHP_MONGO_SERIALIZE_KEY(BSON_LONG);
+      php_mongo_serialize_long(buf, Z_LVAL_PP(data));
+# else
+#  error The PHP number size is neither 4 or 8 bytes; no clue what to do with that!
+# endif
+#endif
+    } else {
+      PHP_MONGO_SERIALIZE_KEY(BSON_INT);
+      php_mongo_serialize_int(buf, Z_LVAL_PP(data));
+    }
     break;
   case IS_DOUBLE:
-    php_mongo_set_type(buf, BSON_DOUBLE);
-    php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+    PHP_MONGO_SERIALIZE_KEY(BSON_DOUBLE);
     php_mongo_serialize_double(buf, Z_DVAL_PP(data));
     break;
   case IS_BOOL:
-    php_mongo_set_type(buf, BSON_BOOL);
-    php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+    PHP_MONGO_SERIALIZE_KEY(BSON_BOOL);
     php_mongo_serialize_bool(buf, Z_BVAL_PP(data));
     break;
   case IS_STRING: {
-    php_mongo_set_type(buf, BSON_STRING);
-    php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+    PHP_MONGO_SERIALIZE_KEY(BSON_STRING);
+
+    // if this is not a valid string, stop
+    if (MonGlo(utf8) && !is_utf8(Z_STRVAL_PP(data), Z_STRLEN_PP(data))) {
+      zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "non-utf8 string: %s", Z_STRVAL_PP(data));
+      return ZEND_HASH_APPLY_STOP;
+    }
 
     php_mongo_serialize_int(buf, Z_STRLEN_PP(data)+1);
     php_mongo_serialize_string(buf, Z_STRVAL_PP(data), Z_STRLEN_PP(data));
@@ -180,12 +221,13 @@ int php_mongo_serialize_element(char *name, zval **data, buffer *buf, int prep T
 
     // if we realloc, we need an offset, not an abs pos (phew)
     int type_offset = buf->pos-buf->start;
-    // skip type until we know whether it was an array or an object
-    buf->pos++;
 
     //serialize
-    php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+    PHP_MONGO_SERIALIZE_KEY(BSON_ARRAY);
     num = zval_to_bson(buf, Z_ARRVAL_PP(data), NO_PREP TSRMLS_CC);
+    if (EG(exception)) {
+      return ZEND_HASH_APPLY_STOP;
+    }
 
     // now go back and set the type bit
     //php_mongo_set_type(buf, BSON_ARRAY);
@@ -205,8 +247,7 @@ int php_mongo_serialize_element(char *name, zval **data, buffer *buf, int prep T
     if(clazz == mongo_ce_Id) {
       mongo_id *id;
 
-      php_mongo_set_type(buf, BSON_OID);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_OID);
       id = (mongo_id*)zend_object_store_get_object(*data TSRMLS_CC);
       if (!id->id) {
 	return ZEND_HASH_APPLY_KEEP;
@@ -216,51 +257,58 @@ int php_mongo_serialize_element(char *name, zval **data, buffer *buf, int prep T
     }
     // MongoDate
     else if (clazz == mongo_ce_Date) {
-      php_mongo_set_type(buf, BSON_DATE);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_DATE);
       php_mongo_serialize_date(buf, *data TSRMLS_CC);
     }
     // MongoRegex
     else if (clazz == mongo_ce_Regex) {
-      php_mongo_set_type(buf, BSON_REGEX);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_REGEX);
       php_mongo_serialize_regex(buf, *data TSRMLS_CC);
     }
     // MongoCode
     else if (clazz == mongo_ce_Code) {
-      php_mongo_set_type(buf, BSON_CODE);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_CODE);
       php_mongo_serialize_code(buf, *data TSRMLS_CC);
+      if (EG(exception)) {
+        return ZEND_HASH_APPLY_STOP;
+      }
     }
     // MongoBin
     else if (clazz == mongo_ce_BinData) {
-      php_mongo_set_type(buf, BSON_BINARY);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_BINARY);
       php_mongo_serialize_bin_data(buf, *data TSRMLS_CC);
     }
     // MongoTimestamp
     else if (clazz == mongo_ce_Timestamp) {
-      php_mongo_set_type(buf, BSON_TIMESTAMP);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_TIMESTAMP);
       php_mongo_serialize_ts(buf, *data TSRMLS_CC);
     }
     else if (clazz == mongo_ce_MinKey) {
-      php_mongo_set_type(buf, BSON_MINKEY);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_MINKEY);
     }
     else if (clazz == mongo_ce_MaxKey) {
-      php_mongo_set_type(buf, BSON_MAXKEY);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_MAXKEY);
+    }
+    // Integer types
+    else if (clazz == mongo_ce_Int32) {
+      PHP_MONGO_SERIALIZE_KEY(BSON_INT);
+      php_mongo_serialize_int32(buf, *data TSRMLS_CC);
+    }
+    else if (clazz == mongo_ce_Int64) {
+      PHP_MONGO_SERIALIZE_KEY(BSON_LONG);
+      php_mongo_serialize_int64(buf, *data TSRMLS_CC);
     }
     // serialize a normal obj
     else {
       HashTable *hash = Z_OBJPROP_PP(data);
 
       // go through the k/v pairs and serialize them
-      php_mongo_set_type(buf, BSON_OBJECT);
-      php_mongo_serialize_key(buf, name, name_len, prep TSRMLS_CC);
+      PHP_MONGO_SERIALIZE_KEY(BSON_OBJECT);
 
       zval_to_bson(buf, hash, NO_PREP TSRMLS_CC);
+      if (EG(exception)) {
+        return ZEND_HASH_APPLY_STOP;
+      }
     } 
     break;
   }
@@ -278,7 +326,7 @@ int resize_buf(buffer *buf, int size) {
     total += size;
   }
 
-  buf->start = (unsigned char*)erealloc(buf->start, total);
+  buf->start = (char*)erealloc(buf->start, total);
   buf->pos = buf->start + used;
   buf->end = buf->start + total;
   return total;
@@ -297,6 +345,39 @@ void php_mongo_serialize_date(buffer *buf, zval *date TSRMLS_DC) {
   
   ms = ((int64_t)Z_LVAL_P(sec) * 1000) + ((int64_t)Z_LVAL_P(usec) / 1000);
   php_mongo_serialize_long(buf, ms);
+}
+
+#if defined(_MSC_VER)
+# define strtoll(s, f, b) _atoi64(s)
+#elif !defined(HAVE_STRTOLL)
+# if defined(HAVE_ATOLL)
+#  define strtoll(s, f, b) atoll(s)
+# else
+#  define strtoll(s, f, b) strtol(s, f, b)
+# endif
+#endif
+
+
+/*
+ * create a bson int from an Int32 object
+ */
+void php_mongo_serialize_int32(buffer *buf, zval *data TSRMLS_DC) {
+  int value;
+  zval *zvalue = zend_read_property(mongo_ce_Int32, data, "value", 5, 0 TSRMLS_CC);
+  value = strtol(Z_STRVAL_P(zvalue), NULL, 10);
+  
+  php_mongo_serialize_int(buf, value);
+}
+
+/*
+ * create a bson long from an Int64 object
+ */
+void php_mongo_serialize_int64(buffer *buf, zval *data TSRMLS_DC) {
+  int64_t value;
+  zval *zvalue = zend_read_property(mongo_ce_Int64, data, "value", 5, 0 TSRMLS_CC);
+  value = strtoll(Z_STRVAL_P(zvalue), NULL, 10);
+  
+  php_mongo_serialize_long(buf, value);
 }
 
 /*
@@ -338,9 +419,12 @@ void php_mongo_serialize_code(buffer *buf, zval *code TSRMLS_DC) {
   // scope
   zid = zend_read_property(mongo_ce_Code, code, "scope", 5, NOISY TSRMLS_CC);
   zval_to_bson(buf, HASH_P(zid), NO_PREP TSRMLS_CC);
-  
+  if (EG(exception)) {
+    return;
+  }
+
   // get total size
-  php_mongo_serialize_size(buf->start+start, buf);
+  php_mongo_serialize_size(buf->start+start, buf TSRMLS_CC);
 }
 
 /*
@@ -439,29 +523,38 @@ void php_mongo_serialize_string(buffer *buf, char *str, int str_len) {
 }
 
 void php_mongo_serialize_int(buffer *buf, int num) {
+  int i = MONGO_32(num);
+
   if(BUF_REMAINING <= INT_32) {
     resize_buf(buf, INT_32);
   }
-  // use mongo_memcpy to deal with big-endianness
-  mongo_memcpy(buf->pos, &num, INT_32);
+
+  memcpy(buf->pos, &i, INT_32);
   buf->pos += INT_32;
 }
 
 void php_mongo_serialize_long(buffer *buf, int64_t num) {
+  int64_t i = MONGO_64(num);
+
   if(BUF_REMAINING <= INT_64) {
     resize_buf(buf, INT_64);
   }
-  // use mongo_memcpy to deal with big-endianness
-  mongo_memcpy(buf->pos, &num, INT_64);
+
+  memcpy(buf->pos, &i, INT_64);
   buf->pos += INT_64;
 }
 
 void php_mongo_serialize_double(buffer *buf, double num) {
+  int64_t dest, *dest_p;
+  dest_p = &dest;
+  memcpy(dest_p, &num, 8);
+  dest = MONGO_64(dest);
+
   if(BUF_REMAINING <= INT_64) {
     resize_buf(buf, INT_64);
   }
-  // use mongo_memcpy to deal with big-endianness
-  mongo_memcpy(buf->pos, &num, DOUBLE_64);
+
+  memcpy(buf->pos, dest_p, DOUBLE_64);
   buf->pos += DOUBLE_64;
 }
 
@@ -470,12 +563,18 @@ void php_mongo_serialize_double(buffer *buf, double num) {
  *    we are inserting, so keys can't have .s in them
  */
 void php_mongo_serialize_key(buffer *buf, char *str, int str_len, int prep TSRMLS_DC) {
+  if (strlen(str) == 0) {
+    zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "zero-length keys are not allowed, did you use $ with double quotes?");
+    return;
+  }
+
   if(BUF_REMAINING <= str_len+1) {
     resize_buf(buf, str_len+1);
   }
 
   if (prep && (strchr(str, '.') != 0)) {
-    zend_error(E_ERROR, "invalid key name: [%s]", str);
+    zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "'.' not allowed in key: %s", str);
+    return;
   }
 
   if (MonGlo(cmd_char) && strchr(str, MonGlo(cmd_char)[0]) == str) {
@@ -506,7 +605,6 @@ void php_mongo_serialize_ns(buffer *buf, char *str TSRMLS_DC) {
   }
 
   if (MonGlo(cmd_char) && strchr(collection, MonGlo(cmd_char)[0]) == collection) {
-    char *tmp = buf->pos;
     memcpy(buf->pos, str, collection-str);
     buf->pos += collection-str;
     *(buf->pos) = '$';
@@ -525,11 +623,195 @@ void php_mongo_serialize_ns(buffer *buf, char *str TSRMLS_DC) {
 /* the position is not increased, we are just filling
  * in the first 4 bytes with the size.
  */
-void php_mongo_serialize_size(unsigned char *start, buffer *buf) {
-  int total = buf->pos - start;
-  // use mongo_memcpy to deal with big-endianness
-  mongo_memcpy(start, &total, INT_32);
+int php_mongo_serialize_size(char *start, buffer *buf TSRMLS_DC) {
+  int total = MONGO_32((buf->pos - start));
+  if (buf->pos - start > 16000000) {
+    zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "insert too large: %d, max: 16000000", buf->pos - start);
+    return FAILURE;
+  }
+  memcpy(start, &total, INT_32);
+  return SUCCESS;
+}
 
+static int insert_helper(buffer *buf, zval *doc TSRMLS_DC) {
+  int start = buf->pos - buf->start;
+
+  int result = zval_to_bson(buf, HASH_P(doc), PREP TSRMLS_CC);
+
+  // throw exception if serialization crapped out
+  if (EG(exception) || FAILURE == result) {
+    return FAILURE;
+  }
+  // return if there were 0 elements
+  else if (0 == result) {
+    zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "no elements in doc");
+    return FAILURE;
+  }
+
+  // throw an exception if the doc was too big
+  if(buf->pos - (buf->start + start) > MAX_OBJECT_LEN) {
+    zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "size of BSON doc is %d bytes, max 4MB", buf->pos - (buf->start + start));
+    return FAILURE;
+  }
+  
+  return php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
+}
+
+int php_mongo_write_insert(buffer *buf, char *ns, zval *doc TSRMLS_DC) {
+  mongo_msg_header header;
+  int start = buf->pos - buf->start;
+
+  CREATE_HEADER(buf, ns, OP_INSERT);
+
+  if (FAILURE == insert_helper(buf, doc TSRMLS_CC)) {
+    return FAILURE;
+  }
+
+  return php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
+}
+
+int php_mongo_write_batch_insert(buffer *buf, char *ns, zval *docs TSRMLS_DC) {
+  int start = buf->pos - buf->start, count = 0;
+  HashPosition pointer;
+  zval **doc;
+  mongo_msg_header header;
+
+  CREATE_HEADER(buf, ns, OP_INSERT);
+
+  for(zend_hash_internal_pointer_reset_ex(HASH_P(docs), &pointer); 
+      zend_hash_get_current_data_ex(HASH_P(docs), (void**)&doc, &pointer) == SUCCESS; 
+      zend_hash_move_forward_ex(HASH_P(docs), &pointer)) {
+
+    if(IS_SCALAR_PP(doc)) {
+      continue;
+    }
+
+    if (FAILURE == insert_helper(buf, *doc TSRMLS_CC)) {
+      return FAILURE;
+    }
+
+    count++;
+  }
+
+  // if there are no elements, don't bother saving
+  if (count == 0) {
+    zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "no documents given");
+    return FAILURE;
+  }
+
+  // this is a hard limit in the db server (util/messages.cpp)
+  if (buf->pos - (buf->start + start) > 16000000) {
+    zend_throw_exception_ex(mongo_ce_Exception, 0 TSRMLS_CC, "insert too large: %d, max: 16000000", buf->pos - (buf->start+start));
+    return FAILURE;
+  }
+
+  return php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
+}
+
+int php_mongo_write_update(buffer *buf, char *ns, int flags, zval *criteria, zval *newobj TSRMLS_DC) {
+  mongo_msg_header header;
+  int start = buf->pos - buf->start;
+
+  CREATE_HEADER(buf, ns, OP_UPDATE);
+
+  php_mongo_serialize_int(buf, flags);
+
+  if (zval_to_bson(buf, HASH_P(criteria), NO_PREP TSRMLS_CC) == FAILURE ||
+      EG(exception) ||
+      zval_to_bson(buf, HASH_P(newobj), NO_PREP TSRMLS_CC) == FAILURE ||
+      EG(exception)) {
+    return FAILURE;
+  }
+
+  return php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
+}
+
+int php_mongo_write_delete(buffer *buf, char *ns, int flags, zval *criteria TSRMLS_DC) {
+  mongo_msg_header header;
+  int start = buf->pos - buf->start;
+
+  CREATE_HEADER(buf, ns, OP_DELETE);
+
+  php_mongo_serialize_int(buf, flags);
+
+  if (zval_to_bson(buf, HASH_P(criteria), NO_PREP TSRMLS_CC) == FAILURE ||
+      EG(exception)) {
+    return FAILURE;
+  }
+
+  return php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
+}
+
+/*
+ * Creates a query string in buf. 
+ *
+ * The following fields of cursor are used:
+ *  - ns
+ *  - opts
+ *  - skip
+ *  - limit
+ *  - query
+ *  - fields
+ *
+ */
+int php_mongo_write_query(buffer *buf, mongo_cursor *cursor TSRMLS_DC) {
+  mongo_msg_header header;
+  int start = buf->pos - buf->start;
+
+  CREATE_HEADER_WITH_OPTS(buf, cursor->ns, OP_QUERY, cursor->opts);
+  cursor->send.request_id = header.request_id;
+
+  php_mongo_serialize_int(buf, cursor->skip);
+  php_mongo_serialize_int(buf, cursor->limit);
+
+  if (zval_to_bson(buf, HASH_P(cursor->query), NO_PREP TSRMLS_CC) == FAILURE ||
+      EG(exception)) {
+    return FAILURE;
+  }
+  if (cursor->fields && zend_hash_num_elements(HASH_P(cursor->fields)) > 0) {
+    if (zval_to_bson(buf, HASH_P(cursor->fields), NO_PREP TSRMLS_CC) == FAILURE ||
+        EG(exception)) {
+      return FAILURE;
+    }
+  }
+
+  return php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
+}
+
+int php_mongo_write_kill_cursors(buffer *buf, mongo_cursor *cursor TSRMLS_DC) {
+  mongo_msg_header header;
+
+  CREATE_MSG_HEADER(MonGlo(request_id)++, 0, OP_KILL_CURSORS);
+  APPEND_HEADER(buf, 0);
+  cursor->send.request_id = header.request_id;
+
+  // # of cursors
+  php_mongo_serialize_int(buf, 1);
+  // cursor ids
+  php_mongo_serialize_long(buf, cursor->cursor_id);
+  return php_mongo_serialize_size(buf->start, buf TSRMLS_CC);
+}
+
+/*
+ * Creates a GET_MORE request
+ *
+ * The following fields of cursor are used:
+ *  - ns
+ *  - recv.request_id
+ *  - limit
+ *  - cursor_id
+ */
+int php_mongo_write_get_more(buffer *buf, mongo_cursor *cursor TSRMLS_DC) {
+  mongo_msg_header header;
+  int start = buf->pos - buf->start;
+
+  CREATE_RESPONSE_HEADER(buf, cursor->ns, cursor->recv.request_id, OP_GET_MORE);
+  cursor->send.request_id = header.request_id;
+
+  php_mongo_serialize_int(buf, cursor->limit);
+  php_mongo_serialize_long(buf, cursor->cursor_id);
+
+  return php_mongo_serialize_size(buf->start + start, buf TSRMLS_CC);
 }
 
 
@@ -545,6 +827,10 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
    */
   char *buf_start = buf;
   char type;
+
+  if (buf == 0) {
+    return 0;
+  }
 
   // for size
   buf += INT_32;
@@ -573,19 +859,27 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
       break;
     }
     case BSON_DOUBLE: {
-#if PHP_C_BIGENDIAN
-      char d[8];
-      mongo_memcpy(d, buf, 8);
-      ZVAL_DOUBLE(value, *(double*)d);
-#else
-      ZVAL_DOUBLE(value, *(double*)buf);
-#endif
+      double d = *(double*)buf;
+      int64_t i, *i_p;
+      i_p = &i;
+
+      memcpy(i_p, &d, DOUBLE_64);
+      i = MONGO_64(i);
+      memcpy(&d, i_p, DOUBLE_64);
+
+      ZVAL_DOUBLE(value, d);
       buf += DOUBLE_64;
       break;
     }
+    case BSON_SYMBOL:
     case BSON_STRING: {
       // len includes \0
-      int len = MONGO_INT(*((int*)buf));
+      int len = MONGO_32(*((int*)buf));
+      if (INVALID_STRING_LEN(len)) {
+        zval_ptr_dtor(&value);
+        zend_throw_exception_ex(mongo_ce_CursorException, 0 TSRMLS_CC, "invalid string length for key \"%s\": %d", name, len);
+        return 0;
+      }
       buf += INT_32;
 
       ZVAL_STRINGL(value, buf, len-1, 1);
@@ -596,12 +890,21 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
     case BSON_ARRAY: {
       array_init(value);
       buf = bson_to_zval(buf, Z_ARRVAL_P(value) TSRMLS_CC);
+      if (EG(exception)) {
+        zval_ptr_dtor(&value);
+        return 0;
+      }
       break;
     }
     case BSON_BINARY: {
       char type;
 
-      int len = MONGO_INT(*(int*)buf);
+      int len = MONGO_32(*(int*)buf);
+      if (INVALID_STRING_LEN(len)) {
+        zval_ptr_dtor(&value);
+        zend_throw_exception_ex(mongo_ce_CursorException, 1 TSRMLS_CC, "invalid binary length for key \"%s\": %d", name, len);
+        return 0;
+      }
       buf += INT_32;
 
       type = *buf++;
@@ -615,7 +918,8 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
        * case, the data will be corrupted.
        */
       if ((int)type == 2) {
-        int len2 = MONGO_INT(*(int*)buf);
+        int len2 = MONGO_32(*(int*)buf);
+
         /* if the lengths match, the data is to spec,
          * so we use len2 as the true length.
          */
@@ -627,10 +931,10 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
 
       object_init_ex(value, mongo_ce_BinData);
 
-      add_property_stringl(value, "bin", buf, len, DUP);
-      buf += len;
+      zend_update_property_stringl(mongo_ce_BinData, value, "bin", strlen("bin"), buf, len TSRMLS_CC);
+      zend_update_property_long(mongo_ce_BinData, value, "type", strlen("type"), type TSRMLS_CC);
 
-      add_property_long(value, "type", type);
+      buf += len;
       break;
     }
     case BSON_BOOL: {
@@ -644,36 +948,47 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
       break;
     }
     case BSON_INT: {
-      ZVAL_LONG(value, MONGO_INT(*((int*)buf)));
+      ZVAL_LONG(value, MONGO_32(*((int*)buf)));
       buf += INT_32;
       break;
     }
     case BSON_LONG: {
-#if PHP_C_BIGENDIAN
-      int64_t li;
-      char *p = &li;
-      mongo_memcpy(p, buf, INT_64);
-      ZVAL_DOUBLE(value, (double)li);
+      if (MonGlo(long_as_object)) {
+        char *buffer;
+
+        spprintf(&buffer, 0, "%lld", (int64_t)MONGO_64(*((int64_t*)buf)));
+        object_init_ex(value, mongo_ce_Int64);
+
+        zend_update_property_string(mongo_ce_Int64, value, "value", strlen("value"), buffer TSRMLS_CC);
+
+        efree(buffer);
+      } else {
+        if (MonGlo(native_long)) {
+#if SIZEOF_LONG == 4
+          zend_throw_exception_ex(mongo_ce_CursorException, 1 TSRMLS_CC, "Can not natively represent the long %llu on this platform", (int64_t)MONGO_64(*((int64_t*)buf)));
+          return 0;
 #else
-      ZVAL_DOUBLE(value, (double)*((int64_t*)buf));
+# if SIZEOF_LONG == 8
+          ZVAL_LONG(value, (long)MONGO_64(*((int64_t*)buf)));
+# else
+#  error The PHP number size is neither 4 or 8 bytes; no clue what to do with that!
+# endif
 #endif
+        } else {
+          ZVAL_DOUBLE(value, (double)MONGO_64(*((int64_t*)buf)));
+        }
+      }
       buf += INT_64;
       break;
     }
     case BSON_DATE: {
-#if PHP_C_BIGENDIAN
-      int64_t d;
-      char *p = &d;
-      mongo_memcpy(p, buf, INT_64);
-#else
-      int64_t d = *((int64_t*)buf);
-#endif
+      int64_t d = MONGO_64(*((int64_t*)buf));
       buf += INT_64;
       
       object_init_ex(value, mongo_ce_Date);
 
-      add_property_long(value, "sec", (long)(d/1000));
-      add_property_long(value, "usec", (long)((d*1000)%1000000));
+      zend_update_property_long(mongo_ce_Date, value, "sec", strlen("sec"), (long)(d/1000) TSRMLS_CC);
+      zend_update_property_long(mongo_ce_Date, value, "usec", strlen("usec"), (long)((d*1000)%1000000) TSRMLS_CC);
 
       break;
     }
@@ -691,8 +1006,8 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
 
       object_init_ex(value, mongo_ce_Regex);
 
-      add_property_stringl(value, "regex", regex, regex_len, 1);
-      add_property_stringl(value, "flags", flags, flags_len, 1);
+      zend_update_property_stringl(mongo_ce_Regex, value, "regex", strlen("regex"), regex, regex_len TSRMLS_CC);
+      zend_update_property_stringl(mongo_ce_Regex, value, "flags", strlen("flags"), flags, flags_len TSRMLS_CC);
 
       break;
     }
@@ -702,33 +1017,41 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
       int code_len;
       char *code;
 
-      object_init_ex(value, mongo_ce_Code);
-      // initialize scope array
-      MAKE_STD_ZVAL(zcope);
-      array_init(zcope);
-
       // CODE has a useless total size field
       if (type == BSON_CODE) {
         buf += INT_32;
       }
 
       // length of code (includes \0)
-      code_len = MONGO_INT(*(int*)buf);
+      code_len = MONGO_32(*(int*)buf);
+      if (INVALID_STRING_LEN(code_len)) {
+        zval_ptr_dtor(&value);
+        zend_throw_exception_ex(mongo_ce_CursorException, 2 TSRMLS_CC, "invalid code length for key \"%s\": %d", name, code_len);
+        return 0;
+      }
       buf += INT_32;
 
       code = buf;
       buf += code_len;
 
+      // initialize scope array
+      MAKE_STD_ZVAL(zcope);
+      array_init(zcope);
+
       if (type == BSON_CODE) {
         buf = bson_to_zval(buf, HASH_P(zcope) TSRMLS_CC);
+        if (EG(exception)) {
+          zval_ptr_dtor(&zcope);
+          return 0;
+        }
       }
 
+      object_init_ex(value, mongo_ce_Code);
       // exclude \0
-      add_property_stringl(value, "code", code, code_len-1, DUP);
-      add_property_zval(value, "scope", zcope);
-
-      // add_property_zval creates an extra zcope ref
+      zend_update_property_stringl(mongo_ce_Code, value, "code", strlen("code"), code, code_len-1 TSRMLS_CC);
+      zend_update_property(mongo_ce_Code, value, "scope", strlen("scope"), zcope TSRMLS_CC);
       zval_ptr_dtor(&zcope);
+
       break;
     }
     /* DEPRECATED
@@ -747,6 +1070,11 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
 
       // ns
       ns_len = *(int*)buf;
+      if (INVALID_STRING_LEN(ns_len)) {
+        zval_ptr_dtor(&value);
+        zend_throw_exception_ex(mongo_ce_CursorException, 3 TSRMLS_CC, "invalid dbref length for key \"%s\": %d", name, ns_len);
+        return 0;
+      }
       buf += INT_32;
       ns = buf;
       buf += ns_len;
@@ -773,9 +1101,9 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
      */
     case BSON_TIMESTAMP: {
       object_init_ex(value, mongo_ce_Timestamp);
-      zend_update_property_long(mongo_ce_Timestamp, value, "sec", strlen("sec"), MONGO_INT(*(int*)buf) TSRMLS_CC);
+      zend_update_property_long(mongo_ce_Timestamp, value, "sec", strlen("sec"), MONGO_32(*(int*)buf) TSRMLS_CC);
       buf += INT_32;
-      zend_update_property_long(mongo_ce_Timestamp, value, "inc", strlen("inc"), MONGO_INT(*(int*)buf) TSRMLS_CC);
+      zend_update_property_long(mongo_ce_Timestamp, value, "inc", strlen("inc"), MONGO_32(*(int*)buf) TSRMLS_CC);
       buf += INT_32;
       break;
     }
@@ -821,3 +1149,31 @@ char* bson_to_zval(char *buf, HashTable *result TSRMLS_DC) {
   return buf;
 }
 
+static int is_utf8(const char *s, int len) {
+  int i;
+
+  for (i=0; i<len; i++) {
+    if (i+3 < len &&
+        (s[i] & 248) == 240 &&
+        (s[i+1] & 192) == 128 &&
+        (s[i+2] & 192) == 128 &&
+        (s[i+3] & 192) == 128) {
+      i += 3;
+    }
+    else if (i+2 < len && 
+             (s[i] & 240) == 224 &&
+             (s[i+1] & 192) == 128 &&
+             (s[i+2] & 192) == 128) {
+      i += 2;
+    }
+    else if (i+1 < len &&
+             (s[i] & 224) == 192 &&
+             (s[i+1] & 192) == 128) {
+      i += 1;
+    }
+    else if ((s[i] & 128) != 0) {
+      return 0;
+    }
+  }
+  return 1;
+}

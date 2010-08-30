@@ -29,6 +29,27 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
       //        $this->assertEquals($this->object->start, memory_get_usage(true));
     }
 
+    /**
+     * @expectedException Exception 
+     */
+    public function testDumbDBName3() {
+      $db = new MongoDB($this->sharedFixture, "\\");
+    }
+
+    /**
+     * @expectedException Exception 
+     */
+    public function testDumbDBName4() {
+      $db = new MongoDB($this->sharedFixture, "\$");
+    }
+
+    /**
+     * @expectedException Exception
+     */
+    public function testDumbDBName5() {
+      $db = new MongoDB($this->sharedFixture, "/");
+    }
+
     public function test__toString() {
         if (preg_match($this->sharedFixture->version_51, phpversion())) {
             $this->markTestSkipped("No implicit __toString in 5.1");
@@ -57,8 +78,8 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
         $this->assertEquals((string)$grid->chunks, "phpunit.foo.chunks");
 
         $grid = $this->object->getGridFS("foo", "bar");
-        $this->assertEquals((string)$grid, "phpunit.foo");
-        $this->assertEquals((string)$grid->chunks, "phpunit.bar");
+        $this->assertEquals((string)$grid, "phpunit.foo.files");
+        $this->assertEquals((string)$grid->chunks, "phpunit.foo.chunks");
     }
 
     public function testGetSetProfilingLevel() {
@@ -85,16 +106,16 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
 
     public function testDrop() {
       $r = $this->object->drop();
-      $this->assertEquals(1, $r['ok'], json_encode($r));
+      $this->assertEquals(true, (bool)$r['ok'], json_encode($r));
     }
 
     public function testRepair() {
       $r = $this->object->repair();
-      $this->assertEquals(1, $r['ok'], json_encode($r));
+      $this->assertEquals(true, (bool)$r['ok'], json_encode($r));
       $r = $this->object->repair(true);
-      $this->assertEquals(1, $r['ok'], json_encode($r));
+      $this->assertEquals(true, (bool)$r['ok'], json_encode($r));
       $r = $this->object->repair(true, true);
-      $this->assertEquals(1, $r['ok'], json_encode($r));
+      $this->assertEquals(true, (bool)$r['ok'], json_encode($r));
     }
 
     public function testSelectCollection() {
@@ -149,6 +170,34 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
         $this->assertNotNull($ns->findOne(array('name'=> new MongoRegex('/droopy/'))));
         $c->drop();
         $this->assertEquals($ns->findOne(array('name'=> new MongoRegex('/droopy/'))), null);
+    }
+
+    public function testDropCollection2() {
+      $ns = $this->object->selectCollection('system.namespaces');
+
+      $this->object->x->insert(array("foo"=>"bar"));
+      $this->assertNotNull($ns->findOne(array('name'=> new MongoRegex('/.x$/'))));
+
+      $this->object->dropCollection('x');
+      $this->assertEquals($ns->findOne(array('name'=> new MongoRegex('/.x$/'))), null);
+
+      $this->object->x->insert(array("foo"=>"bar"));
+      $this->assertNotNull($ns->findOne(array('name'=> new MongoRegex('/.x$/'))));
+
+      $this->object->dropCollection($this->object->x);
+      $this->assertEquals($ns->findOne(array('name'=> new MongoRegex('/.x$/'))), null);
+
+      $mem = memory_get_usage(true);
+      for ($i=0; $i<1000; $i++) {
+        $this->object->dropCollection("form");
+      }
+      $this->assertEquals($mem, memory_get_usage(true));
+
+      $mem = memory_get_usage(true);
+      for ($i=0; $i<1000; $i++) {
+        $this->object->dropCollection($this->object->form);
+      }
+      $this->assertEquals($mem, memory_get_usage(true));
     }
 
     public function testListCollections() {
@@ -209,26 +258,26 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
 
     public function testExecute() {
         $ret = $this->object->execute('4+3*6');
-        $this->assertEquals($ret['retval'], 22);
+        $this->assertEquals($ret['retval'], 22, json_encode($ret));
 
         $ret = $this->object->execute(new MongoCode('function() { return x+y; }', array('x' => 'hi', 'y' => 'bye')));
-        $this->assertEquals($ret['retval'], 'hibye');
+        $this->assertEquals($ret['retval'], 'hibye', json_encode($ret));
 
         $ret = $this->object->execute(new MongoCode('function(x) { return x+y; }', array('y' => 'bye')), array('bye'));
-        $this->assertEquals($ret['retval'], 'byebye');
+        $this->assertEquals($ret['retval'], 'byebye', json_encode($ret));
     }
 
     public function testDBCommand() {
         $x = $this->object->command(array());
         $this->assertEquals($x['errmsg'], "no such cmd");
-        $this->assertEquals($x['ok'], 0);
+        $this->assertEquals((bool)$x['ok'], false);
 
         $created = $this->object->createCollection("system.profile", true, 5000);
 
         $this->object->command(array('profile' => 0));
         $x = $this->object->command(array('profile' => 1));
         $this->assertEquals($x['was'], 0, json_encode($x));
-        $this->assertEquals($x['ok'], 1, json_encode($x));
+        $this->assertEquals((bool)$x['ok'], true, json_encode($x));
     }
 
     public function testCreateRef() {
@@ -252,29 +301,13 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
         $err = $this->object->lastError();
         $this->assertEquals(null, $err['err'], json_encode($err));
         $this->assertEquals(0, $err['n'], json_encode($err));
-        $this->assertEquals(1, $err['ok'], json_encode($err));
+        $this->assertEquals(true, (bool)$err['ok'], json_encode($err));
 
         $this->object->forceError();
         $err = $this->object->lastError();
         $this->assertNotNull($err['err']);
         $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['ok'], 1);
-    }
-
-    public function testPrevError() {
-        $this->object->resetError();
-        $err = $this->object->prevError();
-        $this->assertEquals($err['err'], null);
-        $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['nPrev'], -1);
-        $this->assertEquals($err['ok'], 1);
-        
-        $this->object->forceError();
-        $err = $this->object->prevError();
-        $this->assertNotNull($err['err']);
-        $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['nPrev'], 1);
-        $this->assertEquals($err['ok'], 1);
+        $this->assertEquals((bool)$err['ok'], true);
     }
 
     public function testResetError() {
@@ -282,7 +315,7 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
         $err = $this->object->lastError();
         $this->assertEquals($err['err'], null);
         $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['ok'], 1);
+        $this->assertEquals((bool)$err['ok'], true);
     }
 
     public function testForceError() {
@@ -290,7 +323,18 @@ class MongoDBTest extends PHPUnit_Framework_TestCase
         $err = $this->object->lastError();
         $this->assertNotNull($err['err']);
         $this->assertEquals($err['n'], 0);
-        $this->assertEquals($err['ok'], 1);
-    }    
+        $this->assertEquals((bool)$err['ok'], true);
+    }
+
+    public function testW() {
+      $this->assertEquals(1, $this->object->w);
+      $this->assertEquals(10000, $this->object->wtimeout);
+
+      $this->object->w = 4;
+      $this->object->wtimeout = 60;
+ 
+      $this->assertEquals(4, $this->object->w);
+      $this->assertEquals(60, $this->object->wtimeout);
+   }
 }
 ?>

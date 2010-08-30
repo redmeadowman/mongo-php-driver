@@ -1,6 +1,6 @@
 //mongo_types.c
 /**
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009-2010 10gen, Inc.
  * 
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,7 +37,8 @@
 extern zend_class_entry *mongo_ce_DB,
   *mongo_ce_Exception;
 
-extern zend_object_handlers mongo_default_handlers;
+extern zend_object_handlers mongo_default_handlers,
+  mongo_id_handlers;
 
 ZEND_EXTERN_MODULE_GLOBALS(mongo);
 
@@ -47,7 +48,9 @@ zend_class_entry *mongo_ce_Date = NULL,
   *mongo_ce_Id = NULL,
   *mongo_ce_Code = NULL,
   *mongo_ce_Regex = NULL,
-  *mongo_ce_Timestamp = NULL;
+  *mongo_ce_Timestamp = NULL,
+  *mongo_ce_Int32 = NULL,
+  *mongo_ce_Int64 = NULL;
 
 void generate_id(char *data TSRMLS_DC) {
   int inc;
@@ -92,13 +95,13 @@ void generate_id(char *data TSRMLS_DC) {
   data[3] = T[0];
 
   // 3 bytes machine
-  memcpy(data+4, &MonGlo(machine), 3);
+  memcpy(data+4, M, 3);
 
   // 2 bytes pid
-  memcpy(data+7, &pid, 2);
+  memcpy(data+7, P, 2);
 
   // 3 bytes inc
-  memcpy(data+9, &inc, 3);
+  memcpy(data+9, I, 3);
 #endif /* PHP_C_BIGENDIAN */
 }
 
@@ -126,6 +129,30 @@ int php_mongo_id_unserialize(zval **rval, zend_class_entry *ce, const unsigned c
   return SUCCESS;
 }
 
+int php_mongo_compare_ids(zval *o1, zval *o2 TSRMLS_DC) {
+
+  if (Z_TYPE_P(o1) == IS_OBJECT && Z_TYPE_P(o2) == IS_OBJECT &&
+      instanceof_function(Z_OBJCE_P(o1), mongo_ce_Id TSRMLS_CC) &&
+      instanceof_function(Z_OBJCE_P(o2), mongo_ce_Id TSRMLS_CC)) {
+    int i;
+
+    mongo_id *id1 = (mongo_id*)zend_object_store_get_object(o1 TSRMLS_CC);
+    mongo_id *id2 = (mongo_id*)zend_object_store_get_object(o2 TSRMLS_CC);
+
+    for (i=0; i<12; i++) {
+      if (id1->id[i] < id2->id[i]) {
+        return -1;
+      }
+      else if (id1->id[i] > id2->id[i]) {
+        return 1;
+      }
+    }
+    return 0;
+  }
+
+  return 1;
+}
+
 static void php_mongo_id_free(void *object TSRMLS_DC) {
   mongo_id *id = (mongo_id*)object;
   if (id) {
@@ -138,13 +165,34 @@ static void php_mongo_id_free(void *object TSRMLS_DC) {
 }
 
 static zend_object_value php_mongo_id_new(zend_class_entry *class_type TSRMLS_DC) {
-  php_mongo_obj_new(mongo_id);
+  zend_object_value retval;
+  mongo_id *intern;
+  zval *tmp;
+
+  intern = (mongo_id*)emalloc(sizeof(mongo_id));
+  memset(intern, 0, sizeof(mongo_id));
+
+  zend_object_std_init(&intern->std, class_type TSRMLS_CC);
+  zend_hash_copy(intern->std.properties,
+     &class_type->default_properties,
+     (copy_ctor_func_t) zval_add_ref,
+     (void *) &tmp,
+     sizeof(zval *));
+
+  retval.handle = zend_objects_store_put(intern,
+     (zend_objects_store_dtor_t) zend_objects_destroy_object,
+     php_mongo_id_free, NULL TSRMLS_CC);
+  retval.handlers = &mongo_id_handlers;
+
+  return retval;
 }
 
 static function_entry MongoId_methods[] = {
   PHP_ME(MongoId, __construct, NULL, ZEND_ACC_PUBLIC)
   PHP_ME(MongoId, __toString, NULL, ZEND_ACC_PUBLIC)
+  PHP_ME(MongoId, __set_state, NULL, ZEND_ACC_PUBLIC|ZEND_ACC_STATIC)
   PHP_ME(MongoId, getTimestamp, NULL, ZEND_ACC_PUBLIC)
+  PHP_ME(MongoId, getHostname, NULL, ZEND_ACC_PUBLIC|ZEND_ACC_STATIC)
   { NULL, NULL, NULL }
 };
 
@@ -177,13 +225,13 @@ PHP_METHOD(MongoId, __construct) {
     int i;
     for(i=0;i<12;i++) {
       char digit1 = Z_STRVAL_P(id)[i*2], digit2 = Z_STRVAL_P(id)[i*2+1];
-      digit1 = digit1 >= 'a' && digit1 <= 'f' ? digit1 -= 87 : digit1;
-      digit1 = digit1 >= 'A' && digit1 <= 'F' ? digit1 -= 55 : digit1;
-      digit1 = digit1 >= '0' && digit1 <= '9' ? digit1 -= 48 : digit1;
+      digit1 = digit1 >= 'a' && digit1 <= 'f' ? digit1 - 87 : digit1;
+      digit1 = digit1 >= 'A' && digit1 <= 'F' ? digit1 - 55 : digit1;
+      digit1 = digit1 >= '0' && digit1 <= '9' ? digit1 - 48 : digit1;
       
-      digit2 = digit2 >= 'a' && digit2 <= 'f' ? digit2 -= 87 : digit2;
-      digit2 = digit2 >= 'A' && digit2 <= 'F' ? digit2 -= 55 : digit2;
-      digit2 = digit2 >= '0' && digit2 <= '9' ? digit2 -= 48 : digit2;
+      digit2 = digit2 >= 'a' && digit2 <= 'f' ? digit2 - 87 : digit2;
+      digit2 = digit2 >= 'A' && digit2 <= 'F' ? digit2 - 55 : digit2;
+      digit2 = digit2 >= '0' && digit2 <= '9' ? digit2 - 48 : digit2;
       
       this_id->id[i] = digit1*16+digit2;
     }
@@ -232,6 +280,21 @@ PHP_METHOD(MongoId, __toString) {
 }
 /* }}} */
 
+/* {{{ MongoId::__set_state() 
+ */
+PHP_METHOD(MongoId, __set_state) {
+  zval temp, *dummy;
+
+  MAKE_STD_ZVAL(dummy);
+  ZVAL_STRING(dummy, "000000000000000000000000", 1);
+
+  object_init_ex(return_value, mongo_ce_Id);
+  MONGO_METHOD1(MongoId, __construct, &temp, return_value, dummy);
+
+  zval_ptr_dtor(&dummy);
+}
+/* }}} */
+
 /* {{{ MongoId::getTimestamp
  */
 PHP_METHOD(MongoId, getTimestamp) {
@@ -248,32 +311,57 @@ PHP_METHOD(MongoId, getTimestamp) {
 }
 /* }}} */
 
+/* {{{ MongoId::getHostname
+ */
+PHP_METHOD(MongoId, getHostname) {
+  char hostname[256];
+  gethostname(hostname, 256);
+  RETURN_STRING(hostname, 1);
+}
+/* }}} */
 
 /* {{{ MongoDate::__construct
  */
 PHP_METHOD(MongoDate, __construct) {
-  int arg = 0, usec = 0;
+  zval *arg1 = 0, *arg2 = 0;
 
-  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|ll", &arg, &usec) == FAILURE) {
+  // using "ll" caused segfaults in some 64-bit suhosin-patched php systems
+  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|zz", &arg1, &arg2) == FAILURE) {
     return;
   }
 
-  if (!arg) {
+  switch (ZEND_NUM_ARGS()) {
+  case 2:
+    if (Z_TYPE_P(arg2) != IS_LONG) {
+      zend_error(E_WARNING, "MongoDate:__construct() expects integer values");
+      return;
+    }
+
+    zend_update_property(mongo_ce_Date, getThis(), "usec", strlen("usec"), arg2 TSRMLS_CC);
+
+    // fallthrough
+  case 1:
+    if (Z_TYPE_P(arg1) != IS_LONG) {
+      zend_error(E_WARNING, "MongoDate:__construct() expects integer values");
+      return;
+    }
+
+    zend_update_property(mongo_ce_Date, getThis(), "sec", strlen("sec"), arg1 TSRMLS_CC);
+    // usec is already 0, if not set above
+    break;
+  case 0: {
 #ifdef WIN32
     time_t sec = time(0);
-    add_property_long(getThis(), "sec", sec);
-    add_property_long(getThis(), "usec", 0);
+    zend_update_property_long(mongo_ce_Date, getThis(), "sec", strlen("sec"), sec TSRMLS_CC);
+    zend_update_property_long(mongo_ce_Date, getThis(), "usec", strlen("usec"), 0 TSRMLS_CC);
 #else
     struct timeval time;
     gettimeofday(&time, NULL);
 
-    add_property_long(getThis(), "sec", time.tv_sec);
-    add_property_long(getThis(), "usec", time.tv_usec);
+    zend_update_property_long(mongo_ce_Date, getThis(), "sec", strlen("sec"), time.tv_sec TSRMLS_CC);
+    zend_update_property_long(mongo_ce_Date, getThis(), "usec", strlen("usec"), (time.tv_usec/1000)*1000 TSRMLS_CC);
 #endif
   }
-  else {
-    add_property_long(getThis(), "sec", arg);
-    add_property_long(getThis(), "usec", usec);
   }
 }
 /* }}} */
@@ -282,14 +370,15 @@ PHP_METHOD(MongoDate, __construct) {
 /* {{{ MongoDate::__toString()
  */
 PHP_METHOD(MongoDate, __toString) {
-  zval *zsec = zend_read_property( mongo_ce_Date, getThis(), "sec", 3, 0 TSRMLS_CC );
+  zval *zsec = zend_read_property( mongo_ce_Date, getThis(), "sec", strlen("sec"), NOISY TSRMLS_CC );
   long sec = Z_LVAL_P( zsec );
-  zval *zusec = zend_read_property( mongo_ce_Date, getThis(), "usec", 4, 0 TSRMLS_CC );
+  zval *zusec = zend_read_property( mongo_ce_Date, getThis(), "usec", strlen("usec"), NOISY TSRMLS_CC );
   long usec = Z_LVAL_P( zusec );
   double dusec = (double)usec/1000000;
+  char *str;
 
-  return_value->type = IS_STRING;
-  return_value->value.str.len = spprintf(&(return_value->value.str.val), 0, "%.8f %ld", dusec, sec);
+  spprintf(&str, 0, "%.8f %ld", dusec, sec);
+  RETURN_STRING(str, 0);
 }
 /* }}} */
 
@@ -315,20 +404,14 @@ void mongo_init_MongoDate(TSRMLS_D) {
  */
 PHP_METHOD(MongoBinData, __construct) {
   char *bin;
-  int bin_len, type;
+  long bin_len, type = 2;
 
-  int argc = ZEND_NUM_ARGS();
-  if (argc == 1 &&
-      zend_parse_parameters(argc TSRMLS_CC, "s", &bin, &bin_len) != FAILURE) {
-    type = BIN_BYTE_ARRAY;
-  }
-  else if (argc != 2 ||
-           zend_parse_parameters(argc TSRMLS_CC, "sl", &bin, &bin_len, &type) == FAILURE) {
-    zend_error( E_ERROR, "incorrect parameter types, expected __construct(string, long)" );
+  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|l", &bin, &bin_len, &type) == FAILURE) {
+    return;
   }
   
-  add_property_stringl( getThis(), "bin", bin, bin_len, 1 );
-  add_property_long( getThis(), "type", type);
+  zend_update_property_stringl(mongo_ce_BinData, getThis(), "bin", strlen("bin"), bin, bin_len TSRMLS_CC);
+  zend_update_property_long(mongo_ce_BinData, getThis(), "type", strlen("type"), type TSRMLS_CC);
 }
 /* }}} */
 
@@ -380,11 +463,9 @@ PHP_METHOD(MongoRegex, __construct) {
     zval *oregex, *oflags;
 
     oregex = zend_read_property(mongo_ce_Regex, regex, "regex", strlen("regex"), NOISY TSRMLS_CC);
-    zval_add_ref(&oregex);
     zend_update_property(mongo_ce_Regex, getThis(), "regex", strlen("regex"), oregex TSRMLS_CC);
 
     oflags = zend_read_property(mongo_ce_Regex, regex, "flags", strlen("flags"), NOISY TSRMLS_CC);
-    zval_add_ref(&oflags);
     zend_update_property(mongo_ce_Regex, getThis(), "flags", strlen("flags"), oflags TSRMLS_CC);
   }
   else if (Z_TYPE_P(regex) == IS_STRING) {
@@ -408,8 +489,8 @@ PHP_METHOD(MongoRegex, __construct) {
     eopattern++;
     flags_len = Z_STRLEN_P(regex) - (eopattern-re);
 
-    add_property_stringl( getThis(), "regex", re+1, pattern_len, 1);
-    add_property_stringl( getThis(), "flags", eopattern, flags_len, 1);
+    zend_update_property_stringl(mongo_ce_Regex, getThis(), "regex", strlen("regex"), re+1, pattern_len TSRMLS_CC);
+    zend_update_property_stringl(mongo_ce_Regex, getThis(), "flags", strlen("flags"), eopattern, flags_len TSRMLS_CC);
   }
 }
 /* }}} */
@@ -419,14 +500,13 @@ PHP_METHOD(MongoRegex, __construct) {
  */
 PHP_METHOD(MongoRegex, __toString) {
   char *field_name;
-  zval *zre = zend_read_property( mongo_ce_Regex, getThis(), "regex", 5, 0 TSRMLS_CC );
+  zval *zre = zend_read_property( mongo_ce_Regex, getThis(), "regex", strlen("regex"), NOISY TSRMLS_CC );
   char *re = Z_STRVAL_P( zre );
-  zval *zopts = zend_read_property( mongo_ce_Regex, getThis(), "flags", 5, 0 TSRMLS_CC );
+  zval *zopts = zend_read_property( mongo_ce_Regex, getThis(), "flags", strlen("regex"), NOISY TSRMLS_CC );
   char *opts = Z_STRVAL_P( zopts );
 
-  spprintf(&field_name, 0, "/%s/%s", re, opts );
-  RETVAL_STRING(field_name, 1);
-  efree(field_name);
+  spprintf(&field_name, 0, "/%s/%s", re, opts);
+  RETVAL_STRING(field_name, 0);
 }
 /* }}} */
 
@@ -452,17 +532,18 @@ void mongo_init_MongoRegex(TSRMLS_D) {
 /* {{{ MongoCode::__construct(string) 
  */
 PHP_METHOD(MongoCode, __construct) {
-  zval *code = 0, *zcope = 0;
+  char *code;
+  int code_len;
+  zval *zcope = 0;
 
-  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z|a", &code, &zcope) == FAILURE) {
+  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s|a", &code, &code_len, &zcope) == FAILURE) {
     return;
   }
-  convert_to_string(code);
 
-  zend_update_property(mongo_ce_Code, getThis(), "code", strlen("code"), code TSRMLS_CC);
+  zend_update_property_stringl(mongo_ce_Code, getThis(), "code", strlen("code"), code, code_len TSRMLS_CC);
 
   if (!zcope) {
-    ALLOC_INIT_ZVAL(zcope);
+    MAKE_STD_ZVAL(zcope);
     array_init(zcope);
   }
   else {
@@ -480,7 +561,7 @@ PHP_METHOD(MongoCode, __construct) {
 /* {{{ MongoCode::__toString() 
  */
 PHP_METHOD(MongoCode, __toString ) {
-  zval *zode = zend_read_property(mongo_ce_Code, getThis(), "code", 4, 0 TSRMLS_CC);
+  zval *zode = zend_read_property(mongo_ce_Code, getThis(), "code", strlen("code"), NOISY TSRMLS_CC);
   RETURN_STRING(Z_STRVAL_P(zode), 1 );
 }
 /* }}} */
@@ -543,8 +624,8 @@ PHP_METHOD(MongoDBRef, isRef) {
   }
 
   // check that $ref and $id fields exists
-  if (zend_hash_exists(HASH_P(ref), "$ref", 5) &&
-      zend_hash_exists(HASH_P(ref), "$id", 4)) {
+  if (zend_hash_exists(HASH_P(ref), "$ref", strlen("$ref")+1) &&
+      zend_hash_exists(HASH_P(ref), "$id", strlen("$id")+1)) {
     // good enough
     RETURN_TRUE;
   }
@@ -588,19 +669,9 @@ PHP_METHOD(MongoDBRef, get) {
     // if the name in the $db field doesn't match the current db, make up a new db
     if (strcmp(Z_STRVAL_PP(dbname), Z_STRVAL_P(temp_db->name)) != 0) {
       zval *new_db_z;
-      mongo_db *new_db;
-
-      // create the db
       MAKE_STD_ZVAL(new_db_z);
-      object_init_ex(new_db_z, mongo_ce_DB);
 
-      new_db = (mongo_db*)zend_object_store_get_object(new_db_z TSRMLS_CC);
-      
-      // set up fields
-      new_db->link = temp_db->link;
-      zval_add_ref(&new_db->link);
-      new_db->name = *dbname;
-      zval_add_ref(&new_db->name);
+      MONGO_METHOD1(Mongo, selectDB, new_db_z, temp_db->link, *dbname);
 
       // make the new db the current one
       db = new_db_z;
@@ -704,4 +775,86 @@ PHP_METHOD(MongoTimestamp, __toString) {
   zval *sec = zend_read_property(mongo_ce_Timestamp, getThis(), "sec", strlen("sec"), NOISY TSRMLS_CC);
   spprintf(&str, 0, "%ld", Z_LVAL_P(sec));
   RETURN_STRING(str, 0);
+}
+
+
+
+/* {{{ MongoInt32::__construct(string) 
+ */
+PHP_METHOD(MongoInt32, __construct) {
+  char *value;
+  int value_len;
+  zval *zcope = 0;
+
+  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &value, &value_len) == FAILURE) {
+    return;
+  }
+
+  zend_update_property_stringl(mongo_ce_Int32, getThis(), "value", strlen("value"), value, value_len TSRMLS_CC);
+}
+/* }}} */
+
+
+/* {{{ MongoInt32::__toString() 
+ */
+PHP_METHOD(MongoInt32, __toString ) {
+  zval *zode = zend_read_property(mongo_ce_Int32, getThis(), "value", strlen("value"), NOISY TSRMLS_CC);
+  RETURN_STRING(Z_STRVAL_P(zode), 1 );
+}
+/* }}} */
+
+
+static function_entry MongoInt32_methods[] = {
+  PHP_ME(MongoInt32, __construct, NULL, ZEND_ACC_PUBLIC )
+  PHP_ME(MongoInt32, __toString, NULL, ZEND_ACC_PUBLIC )
+  { NULL, NULL, NULL }
+};
+
+void mongo_init_MongoInt32(TSRMLS_D) {
+  zend_class_entry ce; 
+  INIT_CLASS_ENTRY(ce, "MongoInt32", MongoInt32_methods); 
+  mongo_ce_Int32 = zend_register_internal_class(&ce TSRMLS_CC); 
+
+  zend_declare_property_string(mongo_ce_Int32, "value", strlen("value"), "", ZEND_ACC_PUBLIC TSRMLS_CC);
+}
+
+
+
+/* {{{ MongoInt64::__construct(string) 
+ */
+PHP_METHOD(MongoInt64, __construct) {
+  char *value;
+  int value_len;
+  zval *zcope = 0;
+
+  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &value, &value_len) == FAILURE) {
+    return;
+  }
+
+  zend_update_property_stringl(mongo_ce_Int64, getThis(), "value", strlen("value"), value, value_len TSRMLS_CC);
+}
+/* }}} */
+
+
+/* {{{ MongoInt64::__toString() 
+ */
+PHP_METHOD(MongoInt64, __toString ) {
+  zval *zode = zend_read_property(mongo_ce_Int64, getThis(), "value", strlen("value"), NOISY TSRMLS_CC);
+  RETURN_STRING(Z_STRVAL_P(zode), 1 );
+}
+/* }}} */
+
+
+static function_entry MongoInt64_methods[] = {
+  PHP_ME(MongoInt64, __construct, NULL, ZEND_ACC_PUBLIC )
+  PHP_ME(MongoInt64, __toString, NULL, ZEND_ACC_PUBLIC )
+  { NULL, NULL, NULL }
+};
+
+void mongo_init_MongoInt64(TSRMLS_D) {
+  zend_class_entry ce; 
+  INIT_CLASS_ENTRY(ce, "MongoInt64", MongoInt64_methods); 
+  mongo_ce_Int64 = zend_register_internal_class(&ce TSRMLS_CC); 
+
+  zend_declare_property_string(mongo_ce_Int64, "value", strlen("value"), "", ZEND_ACC_PUBLIC TSRMLS_CC);
 }

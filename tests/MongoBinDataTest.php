@@ -78,4 +78,19 @@ class MongoBinDataTest extends PHPUnit_Framework_TestCase
 	$b = new MongoBinData("");
 	$this->assertEquals(MongoBinData::BYTE_ARRAY, $b->type);
     }
+
+    /**
+     * @expectedException MongoException
+     */
+    public function testNonUTFString()
+    {
+      $this->object->insert(array("str" =>"\xFE"));
+    }
+
+    public function testBinSerializeCheck() {
+      $b = new MongoBinData("\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF");
+      $this->object->insert(array("bin" => $b));
+      $x = $this->object->findOne();
+      $this->assertEquals(2, $x['bin']->type);
+    }
 }

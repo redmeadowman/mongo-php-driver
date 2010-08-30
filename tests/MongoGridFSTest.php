@@ -36,8 +36,8 @@ class MongoGridFSTest extends PHPUnit_Framework_TestCase
     public function test__construct() {
         $db = $this->sharedFixture->selectDB('phpunit');
         $grid = $db->getGridFS('x', 'y');
-        $this->assertEquals((string)$grid, 'phpunit.x');
-        $this->assertEquals((string)$grid->chunks, 'phpunit.y');
+        $this->assertEquals((string)$grid, 'phpunit.x.files');
+        $this->assertEquals((string)$grid->chunks, 'phpunit.x.chunks');
 
         $grid = $db->getGridFS('x');
         $this->assertEquals((string)$grid, 'phpunit.x.files');
@@ -46,6 +46,13 @@ class MongoGridFSTest extends PHPUnit_Framework_TestCase
         $grid = $db->getGridFS();
         $this->assertEquals((string)$grid, 'phpunit.fs.files');
         $this->assertEquals((string)$grid->chunks, 'phpunit.fs.chunks');
+    }
+
+    /**
+     * @expectedException Exception 
+     */
+    public function test__construct2() {
+        $this->sharedFixture->foo->getGridFS(null);
     }
 
     public function testDrop() {
@@ -91,6 +98,25 @@ class MongoGridFSTest extends PHPUnit_Framework_TestCase
 
         $obj = $this->object->findOne('tests/somefile');
         $this->assertNotNull($obj);
+    }
+
+    public function testFindOneFields() {
+        $this->object->storeFile('tests/somefile', array("x" => 1, "y" => "foo", "z" => "bar"));
+        $obj = $this->object->findOne(array(), array("x" => 1, "y" => 1));
+
+        $this->assertEquals(1, $obj->file['x']);
+        $this->assertEquals("foo", $obj->file['y']);
+        $this->assertArrayNotHasKey("z", $obj->file);
+        $this->assertArrayNotHasKey("length", $obj->file);
+    }
+
+    /**
+     * @expectedException MongoGridFSException 
+     */
+    public function testFindOneFields2() {
+        $this->object->storeFile('tests/somefile', array("x" => 1, "y" => "foo", "z" => "bar"));
+        $obj = $this->object->findOne(array(), array("x" => 1, "y" => 1));
+        $obj->getBytes();
     }
 
     public function testRemove()
@@ -180,14 +206,14 @@ class MongoGridFSTest extends PHPUnit_Framework_TestCase
         $w = chr(128);
         $bytes = "${x}4g7$y$z$w$x";
 
-        $this->object->storeBytes($bytes, array('myopt' => $bytes));
+        $this->object->storeBytes($bytes, array('myopt' => new MongoBinData($bytes)));
 
         $obj = $this->object->findOne();
         $this->assertNotNull($obj, "this can be caused by an old db version or if objcheck is on");
 
         $b = $obj->getBytes();
 
-        $this->assertEquals($b, $obj->file['myopt']);
+        $this->assertEquals($b, $obj->file['myopt']->bin);
         $this->assertEquals(8, strlen($b));
 
         $this->assertEquals(0, ord(substr($b, 0)));
@@ -219,6 +245,64 @@ class MongoGridFSTest extends PHPUnit_Framework_TestCase
 
       $this->assertEquals($mongo->file['md5'], md5(file_get_contents("mongo.c")));
       $this->assertEquals($gridfs->file['md5'], md5(file_get_contents("gridfs.c")));
+    }
+
+    public function testFH() {
+      $fh = fopen('tests/somefile', 'r');
+      $this->object->storeFile($fh, array('_id' => 1));
+      $file = $this->object->findOne();
+      $this->assertEquals(129, $file->file['length'], json_encode($file->file));
+      $this->assertEquals(1, $file->file['_id'], json_encode($file->file));
+    }
+
+    public function testOverwrite() {
+      $fh1 = fopen('tests/somefile', 'r');
+      $fh2 = fopen('mongo.c', 'r');
+      $this->object->storeFile($fh1, array('_id' => 1));
+      $this->object->storeFile($fh2, array('_id' => 1));
+
+      $file = $this->object->findOne();
+      $this->assertEquals(129, $file->file['length'], json_encode($file->file));
+    }
+
+    public function testSafeRemove() {
+      $grid = $this->object;
+      $id = $grid->storeFile('tests/Formelsamling.pdf');
+      
+      $x = $grid->remove(array("_id" => $id), array("safe" => true));
+      $this->assertEquals(true, (bool)$x['ok']);
+      $this->assertEquals(1, $x['n']);
+      $this->assertNull($x['err']);
+    }
+
+    public function testPut() {
+      $filename = 'tests/Formelsamling.pdf';
+      $id = $this->object->put($filename);
+
+      $db = $this->object->db;
+      $files = $db->fs->files;
+
+      $file = $files->findOne(array("_id" => $id));
+      $this->assertEquals($id, $file['_id']);
+      $this->assertEquals($filename, $file['filename']);
+    }
+
+    public function testGet() {
+      $filename = 'tests/Formelsamling.pdf';
+      $id = $this->object->put($filename);
+
+      $file = $this->object->get($id);
+      $this->assertEquals($id, $file->file['_id']);
+      $this->assertEquals($filename, $file->file['filename']);
+    }
+
+    public function testDelete() {
+      $filename = 'tests/Formelsamling.pdf';
+      $id = $this->object->put($filename);
+
+      $this->object->delete($id);
+      $file = $this->object->get($id);
+      $this->assertNull($file);
     }
 }
 

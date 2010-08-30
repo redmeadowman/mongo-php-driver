@@ -1,6 +1,6 @@
 // db.c
 /**
- *  Copyright 2009 10gen, Inc.
+ *  Copyright 2009-2010 10gen, Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ zend_class_entry *mongo_ce_DB = NULL;
  * arginfo needs to be set for __get because if PHP doesn't know it only takes
  * one arg, it will issue a warning.
  */
-#if ZEND_MODULE_API_NO <= 20060613
+#if ZEND_MODULE_API_NO < 20090115
 static
 #endif
 ZEND_BEGIN_ARG_INFO_EX(arginfo___get, 0, ZEND_RETURN_VALUE, 1)
@@ -66,13 +66,13 @@ PHP_METHOD(MongoDB, __construct) {
     return;
   }
 
-  if (name_len == 0 ||
-      strchr(name, ' ') ||
-      strchr(name, '.')) {
+  if (0 == name_len ||
+      0 != strchr(name, ' ') || 0 != strchr(name, '.') || 0 != strchr(name, '\\') || 
+      0 != strchr(name, '/') || 0 != strchr(name, '$')) {
 #if ZEND_MODULE_API_NO >= 20060613
-    zend_throw_exception(zend_exception_get_default(TSRMLS_C), "MongoDB::__construct(): database names must be at least one character and cannot contain ' ' or  '.'", 0 TSRMLS_CC);
+    zend_throw_exception_ex(zend_exception_get_default(TSRMLS_C), 0 TSRMLS_CC, "MongoDB::__construct(): invalid name %s", name);
 #else
-    zend_throw_exception(zend_exception_get_default(), "MongoDB::__construct(): database names must be at least one character and cannot contain ' ' or  '.'", 0 TSRMLS_CC);
+    zend_throw_exception_ex(zend_exception_get_default(), 0 TSRMLS_CC, "MongoDB::__construct(): invalid name %s", name);
 #endif /* ZEND_MODULE_API_NO >= 20060613 */
     return;
   }
@@ -114,6 +114,7 @@ PHP_METHOD(MongoDB, getGridFS) {
   zval temp;
   zval *arg1 = 0, *arg2 = 0;
 
+  // arg2 is deprecated
   if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "|zz", &arg1, &arg2) == FAILURE) {
     return;
   }
@@ -123,11 +124,8 @@ PHP_METHOD(MongoDB, getGridFS) {
   if (!arg1) {
     MONGO_METHOD1(MongoGridFS, __construct, &temp, return_value, getThis());
   }
-  else if (!arg2) {
-    MONGO_METHOD2(MongoGridFS, __construct, &temp, return_value, getThis(), arg1);
-  }
   else {
-    MONGO_METHOD3(MongoGridFS, __construct, &temp, return_value, getThis(), arg1, arg2);
+    MONGO_METHOD2(MongoGridFS, __construct, &temp, return_value, getThis(), arg1);
   }
 }
 
@@ -157,8 +155,13 @@ PHP_METHOD(MongoDB, setProfilingLevel) {
 
   zval_ptr_dtor(&data);
 
+  if (EG(exception)) {
+    zval_ptr_dtor(&cmd_return);
+    return;
+  }
+
   if (zend_hash_find(HASH_P(cmd_return), "ok", 3, (void**)&ok) == SUCCESS &&
-      Z_DVAL_PP(ok) == 1) {
+      ((Z_TYPE_PP(ok) == IS_BOOL && Z_BVAL_PP(ok)) || Z_DVAL_PP(ok) == 1)) {
     zend_hash_find(HASH_P(cmd_return), "was", 4, (void**)&ok);
     RETVAL_ZVAL(*ok, 1, 0);
   }
@@ -235,7 +238,6 @@ PHP_METHOD(MongoDB, createCollection) {
 }
 
 PHP_METHOD(MongoDB, dropCollection) {
-  zval temp;
   zval *collection;
 
   if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &collection) == FAILURE) {
@@ -244,12 +246,19 @@ PHP_METHOD(MongoDB, dropCollection) {
 
   if (Z_TYPE_P(collection) != IS_OBJECT ||
       Z_OBJCE_P(collection) != mongo_ce_Collection) {
+    zval *temp;
 
-    MONGO_METHOD1(MongoDB, selectCollection, &temp, getThis(), collection);
-    collection = &temp;
+    MAKE_STD_ZVAL(temp);
+    MONGO_METHOD1(MongoDB, selectCollection, temp, getThis(), collection);
+    collection = temp;
+  }
+  else {
+    zval_add_ref(&collection);
   }
 
   MONGO_METHOD(MongoCollection, drop, return_value, collection);
+
+  zval_ptr_dtor(&collection);
 }
 
 PHP_METHOD(MongoDB, listCollections) {
@@ -431,13 +440,15 @@ PHP_METHOD(MongoDB, command) {
   mongo_db *db;
   char *cmd_ns;
 
-  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &cmd) == FAILURE ||
-      IS_SCALAR_P(cmd)) {
+  if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "z", &cmd) == FAILURE) {
+    return;
+  }
+  if (IS_SCALAR_P(cmd)) {
+    zend_error(E_WARNING, "MongoDB::command() expects parameter 1 to be an array or object");
     return;
   }
 
-  db = (mongo_db*)zend_object_store_get_object(getThis() TSRMLS_CC);
-  MONGO_CHECK_INITIALIZED(db->name, MongoDB);
+  PHP_MONGO_GET_DB(getThis());
 
   // create db.$cmd
   MAKE_STD_ZVAL(ns);
@@ -648,4 +659,7 @@ void mongo_init_MongoDB(TSRMLS_D) {
   zend_declare_class_constant_long(mongo_ce_DB, "PROFILING_OFF", strlen("PROFILING_OFF"), 0 TSRMLS_CC);
   zend_declare_class_constant_long(mongo_ce_DB, "PROFILING_SLOW", strlen("PROFILING_SLOW"), 1 TSRMLS_CC);
   zend_declare_class_constant_long(mongo_ce_DB, "PROFILING_ON", strlen("PROFILING_ON"), 2 TSRMLS_CC);
+
+  zend_declare_property_long(mongo_ce_DB, "w", strlen("w"), 1, ZEND_ACC_PUBLIC TSRMLS_CC);
+  zend_declare_property_long(mongo_ce_DB, "wtimeout", strlen("wtimeout"), PHP_MONGO_DEFAULT_TIMEOUT, ZEND_ACC_PUBLIC TSRMLS_CC);
 }

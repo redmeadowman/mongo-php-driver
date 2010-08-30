@@ -2,6 +2,7 @@
 require_once 'MongoTest.php';
 require_once 'MongoDBTest.php';
 require_once 'MongoCollectionTest.php';
+require_once 'MongoCollectionTest2.php';
 require_once 'MongoCursorTest.php';
 require_once 'MongoGridFSTest.php';
 require_once 'MongoGridFSFileTest.php';
@@ -13,11 +14,13 @@ require_once 'MongoRegexTest.php';
 require_once 'MongoBinDataTest.php';
 require_once 'MongoDateTest.php';
 require_once 'MongoTimestampTest.php';
+require_once 'MongoInt32Test.php';
+require_once 'MongoInt64Test.php';
 
 require_once 'MongoObjectsTest.php';
 require_once 'MongoObjDBTest.php';
 
-require_once 'MongoRegressionTest1.php';
+require_once 'RegressionTest1.php';
 
 require_once 'MongoMemTest.php';
 require_once 'CmdSymbolTest.php';
@@ -34,7 +37,7 @@ class MongoRunner extends PHPUnit_Framework_TestSuite
     {
         $suite = new MongoRunner('Mongo Tests');
         
-        $suite->addTestSuite('MongoDBRefTest');
+        $suite->addTestSuite('MongoCollectionTest2');
         return $suite;
     }
  
