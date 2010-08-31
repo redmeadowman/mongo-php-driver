@@ -60,7 +60,7 @@ ZEND_EXTERN_MODULE_GLOBALS(mongo);
 
 static zend_object_value php_mongo_cursor_new(zend_class_entry *class_type TSRMLS_DC);
 static void make_special(mongo_cursor *);
-static mongo_cursor* send_query(zval*, zval* TSRMLS_DC);
+static int send_query(mongo_cursor *cursor, zval* TSRMLS_DC);
 
 zend_class_entry *mongo_ce_Cursor = NULL;
 
@@ -185,28 +185,6 @@ static void make_special(mongo_cursor *cursor) {
   MAKE_STD_ZVAL(cursor->query);
   array_init(cursor->query);
   add_assoc_zval(cursor->query, "$query", temp);
-}
-
-void php_mongo_store_request(mongo_cursor *cursor TSRMLS_DC) {
-  // store request info in requests list
-  mongo_request *request = (mongo_request*)pemalloc(sizeof(mongo_request), 1);
-  zend_rsrc_list_entry *le;
-  request->id = cursor->send.request_id;
-  request->cursor = 0;
-  request->next = request->prev = 0;
-
-  if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == SUCCESS) {
-    mongo_request *current = le->ptr;
-
-    while (current->next) {
-      current = current->next;
-    }
-    current->next = request;
-    request->prev = current;
-  }
-  else {
-    ZEND_REGISTER_RESOURCE(NULL, request, le_requests);
-  }
 }
 
 /* {{{ MongoCursor::hasNext
@@ -388,53 +366,50 @@ PHP_METHOD(MongoCursor, immortal) {
 }
 /* }}} */
 
+static int send_query(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) { 
+  buffer buf;
+
+  CREATE_BUF(buf, INITIAL_BUF_SIZE);
+  if (php_mongo_write_query(&buf, cursor TSRMLS_CC) == FAILURE) {
+    efree(buf.start);
+    return FAILURE;
+  }
+
+  if (mongo_say(cursor->link, &buf, errmsg TSRMLS_CC) == FAILURE) {
+    if (Z_TYPE_P(errmsg) == IS_STRING) {
+      zend_throw_exception_ex(mongo_ce_CursorException, 1 TSRMLS_CC, "couldn't send query: %s", Z_STRVAL_P(errmsg));
+    }
+    else {
+      zend_throw_exception(mongo_ce_CursorException, "couldn't send query", 1 TSRMLS_CC);
+    }
+    efree(buf.start);
+    return FAILURE;
+  }
+
+  efree(buf.start);
+
+  return SUCCESS;
+}
+
 
 /* {{{ MongoCursor::async
  */
 PHP_METHOD(MongoCursor, async) {
-  mongo_request *request;
-  zend_rsrc_list_entry *le;
-  mongo_cursor *cursor = (mongo_cursor*)zend_object_store_get_object(getThis() TSRMLS_CC);
+  mongo_cursor *cursor;
   char *name_str;
   int name_len;
-  MONGO_CHECK_INITIALIZED(cursor->link, MongoCursor);
 
   if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &name_str, &name_len) == FAILURE) {
     return;
   }
 
-  request = (mongo_request*)pemalloc(sizeof(mongo_request), 1);
-  request->callback = pestrdup(name_str, 1);
+  PHP_MONGO_GET_CURSOR(getThis());
 
-  // check if the callbacks persistent resource exists
-  if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == FAILURE) {
-    zend_rsrc_list_entry le;
+  cursor->callback = pestrdup(name_str, 1);
 
-    // if it doesn't, create it
-    request->next = request->prev = 0;
+  php_mongo_create_le(cursor, "response_list" TSRMLS_CC);
 
-    le.ptr = request;
-    le.type = le_requests;
-    le.refcount = 1;
-
-    zend_hash_add(&EG(persistent_list), "requests", strlen("requests")+1, &le, sizeof(list_entry), NULL);
-  }
-  else {
-    mongo_request *temp;
-
-    // if it does, get to the end of the list and add the new callback
-    temp = le->ptr;
-    while (temp->next) {
-      temp = temp->next;
-    }
-    
-    temp->next = request;
-    request->prev = temp;
-    request->next = 0;
-  }
-
-  send_query(getThis(), return_value TSRMLS_CC);
-  request->id = cursor->send.request_id;
+  send_query(cursor, return_value TSRMLS_CC);
 }
 /* }}} */
 
@@ -622,30 +597,11 @@ PHP_METHOD(MongoCursor, doQuery) {
 
   PHP_MONGO_GET_CURSOR(getThis());
 
-  CREATE_BUF(buf, INITIAL_BUF_SIZE);
-  if (php_mongo_write_query(&buf, cursor TSRMLS_CC) == FAILURE) {
-    efree(buf.start);
-    return;
-  }
-
   MAKE_STD_ZVAL(errmsg);
   ZVAL_NULL(errmsg);
 
-  if (mongo_say(cursor->link, &buf, errmsg TSRMLS_CC) == FAILURE) {
-    if (Z_TYPE_P(errmsg) == IS_STRING) {
-      zend_throw_exception_ex(mongo_ce_CursorException, 1 TSRMLS_CC, "couldn't send query: %s", Z_STRVAL_P(errmsg));
-    }
-    else {
-      zend_throw_exception(mongo_ce_CursorException, "couldn't send query", 1 TSRMLS_CC);
-    }
-    efree(buf.start);
-    zval_ptr_dtor(&errmsg);
-    return;
-  }
-
-  efree(buf.start);
-
-  if (php_mongo_get_reply(cursor, errmsg TSRMLS_CC) == FAILURE) {
+  if (send_query(cursor, errmsg TSRMLS_CC) == FAILURE || 
+      php_mongo_get_reply(cursor, errmsg TSRMLS_CC) == FAILURE) {
     zval_ptr_dtor(&errmsg);
     return;
   }

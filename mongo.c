@@ -87,10 +87,8 @@ static HANDLE cursor_mutex;
 static pthread_mutex_t cursor_mutex = PTHREAD_MUTEX_INITIALIZER; 
 #endif
 
-static void call_callback(mongo_request*, list_entry* TSRMLS_DC);
-
-static int get_header(int, mongo_cursor*, zval*);
-static int get_body(int, mongo_cursor*, zval* TSRMLS_DC);
+static void call_callback(mongo_cursor*, list_entry* TSRMLS_DC);
+static int get_header(int, mongo_cursor* TSRMLS_DC);
 
 zend_object_handlers mongo_default_handlers,
   mongo_id_handlers;
@@ -717,7 +715,7 @@ void mongo_init_Mongo(TSRMLS_D) {
   zend_declare_property_null(mongo_ce_Mongo, "persistent", strlen("persistent"), ZEND_ACC_PROTECTED TSRMLS_CC);
 }
 
-static void call_callback(mongo_request *request, list_entry *le TSRMLS_DC) {
+static void call_callback(mongo_cursor *cursor, list_entry *le TSRMLS_DC) {
   char *lcname;
   zend_function *fptr;
   zval ***params, *retval_ptr;
@@ -728,8 +726,8 @@ static void call_callback(mongo_request *request, list_entry *le TSRMLS_DC) {
   zend_fcall_info_cache fcc;
 
   // execute this callback
-  lcname = zend_str_tolower_dup(request->callback, strlen(request->callback));
-  if (zend_hash_find(EG(function_table), lcname, strlen(request->callback) + 1, (void **)&fptr) == FAILURE) {
+  lcname = zend_str_tolower_dup(cursor->callback, strlen(cursor->callback));
+  if (zend_hash_find(EG(function_table), lcname, strlen(cursor->callback) + 1, (void **)&fptr) == FAILURE) {
     efree(lcname);
     return;
   }
@@ -776,85 +774,103 @@ static void call_callback(mongo_request *request, list_entry *le TSRMLS_DC) {
     zval_ptr_dtor(&retval_ptr);
   }
 
-  // remove this callback
-
-  // relocate prev->next ptr
-  if (request->prev) {
-    request->prev->next = request->next;
-  }
-  else {
-    le->ptr = request->next;
-  }
-
-  // relocate next->prev ptr
-  if (request->next) {
-    request->next->prev = request->prev;
-  }
-
-  pefree(request->callback, 1);
-  pefree(request, 1);
+  // TODO: remove this callback
 }
 
 /*
  * Each connection to the database starts a thread that executes this function.
  * db_listener scoops up any incoming db responses asyncronously 
  */
-void db_listener(void *arg) {
+void *db_listener(void *arg) {
+  php_printf("hi\n");
+  long tid;
+  tid = (long)arg;
+  php_printf("in db listener: %ld\n", tid);
+  pthread_exit(NULL);
+  /*
   mongo_pthread_arg *parg = (mongo_pthread_arg*)arg;
   TSRMLS_D = parg->tsrmls_cc;
   mongo_link *link = parg->link;
+  php_printf("got link\n");
   int sock = php_mongo_get_master(link TSRMLS_CC);
   mongo_server_set *set = ((mongo_link*)link)->server_set;
   zend_rsrc_list_entry *le;
 
 
+  php_printf("set is set: %p\n", set);
   while (set) {
-    int ts = time(0), done = 0;
-    mongo_cursor *cursor = (mongo_cursor*)pemalloc(sizeof(mongo_cursor), 1);
-    mongo_msg_header recv;
-    mongo_request *request = 0;
-    zval *errmsg;
+    int status = 0, found = 0;
+    cursor_node *node = 0, *first = 0;
+    mongo_cursor *cursor;
+    struct timeval timeout;
+    fd_set readfds, exceptfds;
 
-    if (!request) {
-      if (zend_hash_find(&EG(persistent_list), "requests", strlen("requests")+1, (void**)&le) == SUCCESS) {
-        request = (mongo_request*)le->ptr;
+    // see if there's a new response 1x/sec
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+      
+    FD_ZERO(&readfds);
+    FD_SET(sock, &readfds);
+    FD_ZERO(&exceptfds);
+    FD_SET(sock, &exceptfds);
+    
+    status = select(sock+1, &readfds, NULL, &exceptfds, &timeout);
+
+    // what to do on failure?      
+    if (status == -1 || FD_ISSET(sock, &exceptfds)) {
+    }
+
+    // timeout, try again
+    if (status == 0 || !FD_ISSET(sock, &readfds)) {
+      continue;
+    }
+
+    cursor = (mongo_cursor*)pemalloc(sizeof(mongo_cursor), 1);
+    // we have a new response 
+    if (FAILURE == get_header(sock, cursor TSRMLS_CC) ||
+        FAILURE == get_cursor_body(sock, cursor TSRMLS_CC)) {
+      // clear exception
+      EG(exception) = 0;
+      continue;
+    }
+
+    // get the responses
+    if (zend_hash_find(&EG(persistent_list), "response_list", strlen("response_list")+1, (void**)&le) == SUCCESS) {
+      first = node = (cursor_node*)le->ptr;
+    }
+    else {
+      //        pthread_yield();
+      continue;
+    }
+
+    while (node) {
+      if (node->cursor->send.request_id == cursor->recv.response_to) {
+        // copy cursor into le
+        node->cursor->start = cursor->start;
+        node->cursor->at = cursor->at;
+        node->cursor->num = cursor->num;
+        node->cursor->buf.start = cursor->buf.start;
+        node->cursor->buf.end = cursor->buf.end;
+        node->cursor->buf.pos = cursor->buf.pos;
+
+        found = 1;
       }
-      else {
-        //        pthread_yield();
-        continue;
+    }
+
+    if (!found) {
+      php_mongo_create_le(cursor, "response_list" TSRMLS_CC);
+    }
+
+    // look through the response list if anything has a callback
+    node = first;
+    while (node) {
+      if (node->cursor->callback) {
+        php_printf("calling callback\n");
+        call_callback(node->cursor, le TSRMLS_CC);
       }
+      node = node->next;
     }
-
-    // make a cursor
-    cursor->link = link;
-    cursor->recv = recv;
-
-    // get the db response
-    MAKE_STD_ZVAL(errmsg);
-    ZVAL_NULL(errmsg);
-    if (get_header(sock, cursor, errmsg) == FAILURE) {
-      zval_ptr_dtor(&errmsg);
-      break;
-    }
-    if(get_body(sock, cursor, errmsg TSRMLS_CC) == FAILURE) {
-      zval_ptr_dtor(&errmsg);
-      break;
-    }
-    zval_ptr_dtor(&errmsg);
-
-    // if it has a callback registered, execute that
-    while (request) {
-      if (request->id == cursor->recv.response_to) {
-        request->cursor = cursor;
-        if (request->callback) {
-          php_printf("calling callback\n");
-          call_callback(request, le TSRMLS_CC);
-          break;
-        }
-      }
-      request = request->next;
-    }
-  }
+    }*/
 }
 
 
@@ -1321,14 +1337,16 @@ static void connect_already(INTERNAL_FUNCTION_PARAMETERS, zval *errmsg) {
   /* 
    * multithreading stuff!!!
    */
-  pthread_t thread_id;
-  mongo_pthread_arg *temp_arg = (mongo_pthread_arg*)pemalloc(sizeof(mongo_pthread_arg), 1);
+  /*mongo_pthread_arg *temp_arg = (mongo_pthread_arg*)pemalloc(sizeof(mongo_pthread_arg), 1);
   temp_arg->link = link;
-  temp_arg->tsrmls_cc = TSRMLS_C;
-  pthread_create(&thread_id, NULL, (void*)db_listener, (void*)temp_arg);
-
-
-
+  temp_arg->tsrmls_cc = TSRMLS_C;*/
+  pthread_t *thread_id;
+  thread_id = (pthread_t*)pemalloc(sizeof(pthread_t), 1);
+  long t = 1;
+  php_printf("calling db_listener\n");
+  int rc = pthread_create(thread_id, NULL, db_listener, (void*)t);
+  php_printf("called: %d\n", rc);
+  //  */
 
 
   /* 
@@ -2263,67 +2281,6 @@ int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
 #else
     zend_throw_exception_ex(mongo_ce_CursorException, 8 TSRMLS_CC, "error getting database response: %d", strerror(errno));
 #endif
-    return FAILURE;
-  }
-  return num_returned;
-}
-
-int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
-  int sock = php_mongo_get_master(cursor->link TSRMLS_CC);
-  int num_returned = 0;
-
-  if (php_mongo_check_connection(cursor->link, errmsg TSRMLS_CC) != SUCCESS) {
-    ZVAL_STRING(errmsg, "could not establish db connection", 1);
-    return FAILURE;
-  }
-
-  // set a timeout
-  if (cursor->timeout && cursor->timeout > 0) {
-    struct timeval timeout;
-    fd_set readfds;
-
-    timeout.tv_sec = cursor->timeout / 1000 ;
-    timeout.tv_usec = (cursor->timeout % 1000) * 1000;
-
-    FD_ZERO(&readfds);
-    FD_SET(sock, &readfds);
-
-    select(sock+1, &readfds, NULL, NULL, &timeout);
-
-    if (!FD_ISSET(sock, &readfds)) {
-      ZVAL_NULL(errmsg);
-      zend_throw_exception(mongo_ce_CursorTOException, "Cursor timed out", 0 TSRMLS_CC);
-      return FAILURE;
-    }
-  }
-
-  if (get_header(sock, cursor, errmsg) == FAILURE) {
-    return FAILURE;
-  }
-
-  // check that this is actually the response we want
-  while (cursor->send.request_id != cursor->recv.response_to) {
-    // if it's not... 
-
-    // TODO: check that the request_id isn't on async queue
-    // temp: we have no async queue, so this is always true
-    if (1) {
-      char temp[4096];
-      // throw out the rest of the headers and the response
-      if (recv(sock, (char*)temp, 20, FLAGS) == FAILURE ||
-          mongo_hear(cursor->link, (void*)temp, cursor->recv.length-REPLY_HEADER_LEN TSRMLS_CC) == FAILURE) {
-        ZVAL_STRING(errmsg, "couldn't get response to throw out", 1);
-        return FAILURE;
-      }
-    }
-
-    // get the next db response
-    if (get_header(sock, cursor, errmsg) == FAILURE) {
-      return FAILURE;
-    }
-  }
-
-  if ((num_returned = get_body(sock, cursor, errmsg TSRMLS_CC)) == FAILURE) {
     return FAILURE;
   }
 

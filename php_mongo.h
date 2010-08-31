@@ -401,6 +401,9 @@ typedef struct {
 
   zval *current;
 
+  // for async queries
+  char *callback;
+
 } mongo_cursor;
 
 /*
@@ -421,24 +424,12 @@ typedef struct _cursor_node {
   struct _cursor_node *prev;
 } cursor_node;
 
-void php_mongo_free_cursor_node(cursor_node*, list_entry*);
-
-typedef struct _mongo_request {
-  int id;
-  mongo_cursor *cursor;
-
-  // optional callback for async request
-  char *callback;
-
-  struct _mongo_request *next;
-  struct _mongo_request *prev;
-} mongo_request;
-
 typedef struct _pthread_arg {
     mongo_link *link;
     void *tsrmls_cc;
 } mongo_pthread_arg;
 
+void php_mongo_free_cursor_node(cursor_node*, list_entry*);
 
 typedef struct {
   zend_object std;
