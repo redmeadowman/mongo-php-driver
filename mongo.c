@@ -2000,12 +2000,7 @@ int php_mongo_get_reply(mongo_cursor *cursor, zval *errmsg TSRMLS_DC) {
       response = response->next;
     }
 
-    // if we didn't find it, give up
-    if (!response) {
-      UNLOCK;
-      zend_throw_exception(mongo_ce_CursorException, "couldn't find reply, please try again", 11 TSRMLS_CC);
-      return FAILURE;
-    }
+    // if we didn't find it, responses might have gotten shuffled
   }
 
   if ((sock = get_socket(cursor->link, errmsg TSRMLS_CC)) == FAILURE) {
