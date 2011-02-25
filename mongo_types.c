@@ -454,7 +454,98 @@ PHP_METHOD(MongoBinData, __construct) {
 /* {{{ MongoBinData::__toString() 
  */
 PHP_METHOD(MongoBinData, __toString) {
-  RETURN_STRING( "<Mongo Binary Data>", 1 );
+  zval *zmbin = zend_read_property( mongo_ce_BinData, getThis(), "bin", strlen("bin"), NOISY TSRMLS_CC );
+  zval *zmtype = zend_read_property( mongo_ce_BinData, getThis(), "type", strlen("type"), NOISY TSRMLS_CC );
+  unsigned char *mbin = Z_STRVAL_P( zmbin );
+  int  mbinlen = Z_STRLEN_P( zmbin );
+  long mtype = Z_LVAL_P( zmtype );
+
+  char *type_str;
+
+  switch (mtype)
+  {
+    case 0x01:  type_str = "FUNC"; break;
+    case 0x02:  type_str = "BYTE_ARRAY"; break;
+    case 0x03: {
+        int uuid_len = 33;
+        char *uuid = (char*)emalloc(uuid_len);
+
+        snprintf(uuid, uuid_len, "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+            mbin[0], mbin[1], mbin[2], mbin[3], mbin[4], mbin[5], mbin[6], mbin[7], 
+            mbin[8], mbin[9], mbin[10], mbin[11], mbin[12], mbin[13], mbin[14], mbin[15]);
+
+        RETURN_STRING(uuid, NO_DUP);
+    }
+    case 0x05:  type_str = "MD5"; break;
+    case 0x06: {
+        unsigned char ip_mask = *mbin++;
+        int ip_str_len = 64;
+        char *ip_str = (char*)emalloc(ip_str_len);
+
+        if (mbinlen == 5){ /* IPv4 */
+            if (ip_mask < 32) {
+                snprintf(ip_str, ip_str_len, "%d.%d.%d.%d/%d",
+                    mbin[0], mbin[1], mbin[2], mbin[3], ip_mask);
+            } else {
+                snprintf(ip_str, ip_str_len, "%d.%d.%d.%d",
+                    mbin[0], mbin[1], mbin[2], mbin[3]);
+            }
+        }
+        else if (mbinlen == 17) { /* IPv6 */
+            unsigned long long ll0 = *(unsigned long long*)&mbin[0];
+            unsigned short s4 = *(unsigned short*)&mbin[8];
+            unsigned short s5 = *(unsigned short*)&mbin[10];
+            int containsIPv4 = (ll0 == 0) && (s4 == 0) && (s5 == 0xFFFF);
+
+            if (containsIPv4) {
+                if (ip_mask < 128) {
+                    snprintf(ip_str, ip_str_len,
+                        "%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%d.%d.%d.%d/%d",
+                        mbin[0], mbin[1], mbin[2], mbin[3], mbin[4], mbin[5], mbin[6], mbin[7],
+                        mbin[8], mbin[9], mbin[10], mbin[11], mbin[12], mbin[13], mbin[14], mbin[15],
+                        ip_mask);
+                } else {
+                    snprintf(ip_str, ip_str_len,
+                        "%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%d.%d.%d.%d",
+                        mbin[0], mbin[1], mbin[2], mbin[3], mbin[4], mbin[5], mbin[6], mbin[7],
+                        mbin[8], mbin[9], mbin[10], mbin[11], mbin[12], mbin[13], mbin[14], mbin[15]);
+                }
+            } else {
+                if (ip_mask < 128) {
+                    snprintf(ip_str, ip_str_len,
+                        "%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X/%d",
+                        mbin[0], mbin[1], mbin[2], mbin[3], mbin[4], mbin[5], mbin[6], mbin[7],
+                        mbin[8], mbin[9], mbin[10], mbin[11], mbin[12], mbin[13], mbin[14], mbin[15],
+                        ip_mask);
+                } else {
+                    snprintf(ip_str, ip_str_len,
+                        "%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X:%02X%02X",
+                        mbin[0], mbin[1], mbin[2], mbin[3], mbin[4], mbin[5], mbin[6], mbin[7],
+                        mbin[8], mbin[9], mbin[10], mbin[11], mbin[12], mbin[13], mbin[14], mbin[15]);
+                }
+            }
+        } else {
+            snprintf(ip_str, ip_str_len, "INVALID");
+        }
+
+        RETURN_STRING(ip_str, NO_DUP);
+    }
+    case 0x07: {
+        int mac_len = 33;
+        char *mac = (char*)emalloc(mac_len);
+
+        snprintf(mac, mac_len, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mbin[0], mbin[1], mbin[2], mbin[3], mbin[4], mbin[5]);
+
+        RETURN_STRING(mac, NO_DUP);
+    }
+    case 0x80:  type_str = "CUSTOM"; break;
+    default:    type_str = "INVALID"; break;
+  }
+
+  char *str;
+  spprintf(&str, 0, "<Mongo Binary Data(%s)>", type_str);
+  RETURN_STRING(str, 0);
 }
 /* }}} */
 
@@ -482,6 +573,8 @@ void mongo_init_MongoBinData(TSRMLS_D) {
   zend_declare_class_constant_long(mongo_ce_BinData, "BYTE_ARRAY", strlen("BYTE_ARRAY"), 0x02 TSRMLS_CC);
   zend_declare_class_constant_long(mongo_ce_BinData, "UUID", strlen("UUID"), 0x03 TSRMLS_CC);
   zend_declare_class_constant_long(mongo_ce_BinData, "MD5", strlen("MD5"), 0x05 TSRMLS_CC);
+  zend_declare_class_constant_long(mongo_ce_BinData, "IPADDR", strlen("IPADDR"), 0x06 TSRMLS_CC);
+  zend_declare_class_constant_long(mongo_ce_BinData, "MACADDR", strlen("MACADDR"), 0x07 TSRMLS_CC);
   zend_declare_class_constant_long(mongo_ce_BinData, "CUSTOM", strlen("CUSTOM"), 0x80 TSRMLS_CC);
 }
 
