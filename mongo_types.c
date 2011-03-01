@@ -531,7 +531,7 @@ PHP_METHOD(MongoBinData, __toString) {
         RETURN_STRING(ip_str, NO_DUP);
     }
     case 0x07: {
-        int mac_len = 33;
+        int mac_len = 20;
         char *mac = (char*)emalloc(mac_len);
 
         snprintf(mac, mac_len, "%02X:%02X:%02X:%02X:%02X:%02X",
